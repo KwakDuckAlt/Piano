@@ -673,7 +673,7 @@ const Input = (() => {
       st.detect = notes; st.rmsFrame = res.rms;
       const evs = tracker.update(notes, t, N / st.sr);
       const comp = (S.latencyMs ?? 0) / 1000;
-      for (const e of evs) emit({ type: e.type, midi: e.midi, vel: clamp(e.amp ? 0.3 + e.amp * 2 : 0.6, 0.2, 1), src: 'mic', time: e.time - comp, conf: e.conf, dur: e.dur });
+      for (const e of evs) emit({ type: e.type, midi: e.midi, vel: clamp(e.amp ? 0.3 + e.amp * 2 : 0.6, 0.2, 1), src: 'mic', time: e.time - comp, conf: e.conf, dur: e.dur, retrig: !!e.retrig });
       subs.forEach(fn => fn({ type: 'frame', notes, level: st.level, rms: res.rms, time: t }));
     }
   }
@@ -1169,6 +1169,7 @@ class Matcher {
     // 옥타브 오류 여부
     let oct = false;
     if (!this.o.ignorePitch) for (const s of this.steps) { if (Math.abs(inp.time - s.t) <= tl && s.notes.some(n => !n.hit && n.p % 12 === inp.midi % 12 && n.p !== inp.midi)) oct = true; }
+    if (inp.soft) return { ok: false, ignored: true };
     inp.extra = true; inp.oct = oct; this.extras.push(inp);
     return { ok: false, oct };
   }
@@ -1208,6 +1209,13 @@ class Runner {
     this.end = this.o.to ?? scoreBeats(S); this.bpm = beatsPerBar(S);
     this.marks = {};
   }
+  /* 마이크 가짜 인식(배음·같은 음 재인식·낮은 신뢰도) 판별 — 악보와 일치하지 않을 때만 호출되어 '오답'에서 제외 */
+  ghost(e) {
+    if (e.src !== 'mic') return false; const R = this.recent || (this.recent = []), t = e.time;
+    while (R.length && t - R[0].time > 2) R.shift();
+    return !!(e.retrig || (e.conf != null && e.conf < 0.5) || R.some(r => (r.midi === e.midi && t > r.time && t - r.time < 1.4) || (r.midi !== e.midi && Math.abs(t - r.time) < 0.7 && ([12, 19, 24, 28, 31, 34, 36].includes(e.midi - r.midi) || ([12, 24].includes(r.midi - e.midi) && (e.conf == null || e.conf < 0.85))))));
+  }
+  seen(e) { if (e.src === 'mic') (this.recent || (this.recent = [])).push({ midi: e.midi, time: e.time }); }
   key(n) { return n.si + ':' + n.ei; }
   mark(n, st) { const k = this.key(n); if (this.marks[k] === 'bad' && st === 'ok') return; this.marks[k] = st; this.ui.onMark && this.ui.onMark(k, st); }
   start() {
@@ -1236,16 +1244,17 @@ class Runner {
     if (!this.running) return;
     if (e.type !== 'on') { if (e.type === 'off' && this.matcher) { const i = [...this.matcher.inputs].reverse().find(x => x.midi === e.midi && x.off === undefined); if (i) { i.off = e.time; if (i.matched) i.matched.dur = e.time - i.time; } } return; }
     if (this.o.mode === 'wait') {
-      const s = this.steps[this.idx]; if (!s) return; const n = s.notes.find(x => x.p === e.midi && !this.pressed.has(x.p));
+      const s = this.steps[this.idx]; if (!s) return; const n = s.notes.find(x => x.p === e.midi && !this.pressed.has(x.p)); const gh = !n && this.ghost(e); this.seen(e);
       if (n) { this.pressed.add(n.p); this.corr++; this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); if (this.pressed.size === s.notes.length) { s.notes.forEach(x => this.mark(x, this.stepErr ? 'bad' : 'ok')); if (this.stepErr) this.badBeats.push(s.t); this.idx++; setTimeout(() => this.running && this.showStep(), 120); } }
-      else if (!this.pressed.has(e.midi) && !(e.src === 'mic' && e.conf < 0.5)) { this.errs++; this.stepErr = true; this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi); }
+      else if (!this.pressed.has(e.midi) && !gh) { this.errs++; this.stepErr = true; this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi); }
       this.ui.onProgress && this.ui.onProgress(this.idx / this.steps.length, this.errs);
       return;
     }
     if (this.o.mode !== 'timed') return;
     const inp = { midi: e.midi, time: e.time, src: e.src === 'mic' ? 'mic' : 'midi', conf: e.conf };
     if (inp.time < this.t0 - this.spb * 1.2) return;  // 카운트인 이전 입력 무시
-    const r = this.matcher.addInput(inp);
+    inp.soft = this.ghost(e); this.seen(e);
+    const r = this.matcher.addInput(inp); if (r.ignored) return;
     if (r.ok) { r.step.notes.forEach(n => { if (n.hit) this.mark(n, 'ok'); }); this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); this.ui.onJudge && this.ui.onJudge(Math.abs(r.dt) < 0.06 ? 'PERFECT' : Math.abs(r.dt) < 0.12 ? 'GREAT' : r.dt < 0 ? 'EARLY' : 'LATE'); }
     else { this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi, r.oct); this.ui.onJudge && this.ui.onJudge(r.oct ? 'OCTAVE' : 'WRONG'); }
   }
