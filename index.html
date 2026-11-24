@@ -640,17 +640,36 @@ const Input = (() => {
     const gain = Math.pow(10, (S.gainDb || 0) / 20); // 입력 레벨 보정
     for (let i = 0; i < n; i++) { ring[ringPos] = b[i] * gain; ringPos = (ringPos + 1) % ring.length; } filled = Math.min(ring.length, filled + n);
     if (onset.gate !== (S.gate || 0.006)) { onset.gate = S.gate || 0.006; }
-    if (onset.push(r * gain, t)) { tracker.addOnset(t - 0.012); st.lastOnset = t; }
+    const nf = S.nf ?? 2, snr = [0, 2.5, 4, 6][nf] || 0;
+    // 소음 바닥: 최근 4초 구간 평균 에너지의 하위 25% (연주 사이 쉬는 구간·배경 잡음 수준)
+    const bk = st.bk || (st.bk = { t: t, s: 0, n: 0, h: [] }); bk.s += r; bk.n++;
+    if (t - bk.t >= 0.05) { const v = bk.s / bk.n; bk.t = t; bk.s = 0; bk.n = 0; if (v > 1e-5) { bk.h.push(v); if (bk.h.length > 80) bk.h.shift(); const q = bk.h.slice().sort((x, y) => x - y); st.floor = q[Math.floor(q.length * 0.25)]; } }
+    if (!st.floor) st.floor = 1e-4;
+    const loud = !snr || r > st.floor * snr;
+    if (onset.push(r * gain, t)) { tracker.addOnset(t - 0.012); st.lastOnset = t; if (loud) st.armedUntil = t + [99, 3, 2.2, 1.5][nf]; }
     sinceHop += n;
     if (sinceHop >= (S.hop || 1024) && filled >= ring.length) {
       sinceHop = 0;
       const N = ring.length, fr = new Float32Array(N); for (let i = 0; i < N; i++) fr[i] = ring[(ringPos + i) % N];
       const sens = S.sens ?? 1; ana.opt.relThr = 0.012 / sens; ana.opt.minSal = 0.42 / Math.sqrt(sens);
       const res = ana.analyze(fr, (S.gate || 0.006) * 0.5);
-      let notes = res.notes.filter(x => x.conf >= (S.minConf || 0.35));
+      let notes = res.notes.filter(x => x.conf >= (S.minConf || 0.35) + (nf ? 0.04 * nf : 0));
+      if (nf) {
+        // 잡음·숨소리·말소리 걸러내기: ①소음 바닥보다 충분히 커야 함 ②타건(급격한 시작) 없이는 새 음 금지 ③배음 구조 확인
+        const act = new Set(tracker.active().map(a => a.midi)), armed = t < (st.armedUntil || 0);
+        if (!loud) notes = notes.filter(x => act.has(x.midi) && r > st.floor * 1.3);
+        else if (!armed) notes = notes.filter(x => act.has(x.midi));
+        notes = notes.filter(x => (x.harm == null || x.harm >= 2) && !(nf >= 2 && x.midi < 33 && x.conf < 0.7));
+        if (nf >= 2 && notes.length > 4) notes = notes.slice().sort((a, b) => b.conf - a.conf).slice(0, 4);
+      }
       // 단음이면 YIN으로 교차 검증 및 센트 계산
       st.yin = null;
       if (notes.length === 1) { const y = DSP.yin(fr.subarray(N - 4096), st.sr); if (y.f0 > 0) { st.yin = y; notes[0].cents = (DSP.f2m(y.f0) - notes[0].midi) * 100; notes[0].yin = y.f0; if (Math.abs(notes[0].cents) > 60) { const ym = Math.round(DSP.f2m(y.f0)); if (y.prob > 0.9 && Math.abs(ym - notes[0].midi) === 12) { notes[0].midi = ym; notes[0].octFix = true; } } } else notes[0].cents = (DSP.f2m(res.peaks ? notes[0].f0 : 0) - notes[0].midi) * 100; }
+      if (nf >= 2) { // 음높이가 계속 흔들리면(말소리·노래) 피아노가 아님
+        const H = st.cH || (st.cH = []);
+        if (notes.length === 1 && notes[0].cents != null) { H.push(notes[0].cents); if (H.length > 6) H.shift(); } else if (!notes.length) H.length = 0;
+        if (H.length >= 5 && t - (st.lastOnset || 0) > 0.25) { const m = H.reduce((a, b) => a + b, 0) / H.length, sd = Math.sqrt(H.reduce((a, b) => a + (b - m) * (b - m), 0) / H.length); if (sd > (nf >= 3 ? 14 : 22)) { notes = []; st.voiceLike = t; } }
+      }
       st.detect = notes; st.rmsFrame = res.rms;
       const evs = tracker.update(notes, t, N / st.sr);
       const comp = (S.latencyMs ?? 0) / 1000;
@@ -1894,7 +1913,7 @@ P.stages = STAGES; P.special = SPECIAL; P.songs = SONGS;
 /* PIANOVA UI 기반 — 설정, 토스트/모달, 건반 컴포넌트, 계정, 라우터, 홈/아카데미/프로필/업적/설정/계정 화면 */
 const SET = [
   ['오디오', 'deviceId', 'device', '입력 장치', ''], ['오디오', 'gainDb', 'range', '입력 레벨 보정(dB)', 0, -12, 36, 1], ['오디오', 'gate', 'range', '노이즈 게이트(RMS, 높을수록 작은 소리 무시)', 0.006, 0.001, 0.05, 0.001],
-  ['오디오', 'sens', 'range', '음정 인식 민감도', 1, 0.3, 3, 0.1], ['오디오', 'minConf', 'range', '최소 인식 신뢰도', 0.35, 0.1, 0.9, 0.05], ['오디오', 'noiseSup', 'bool', '브라우저 노이즈 제거 (피아노에는 끄는 것을 권장)', false],
+  ['오디오', 'sens', 'range', '음정 인식 민감도', 1, 0.3, 3, 0.1], ['오디오', 'minConf', 'range', '최소 인식 신뢰도', 0.35, 0.1, 0.9, 0.05], ['오디오', 'nf', 'range', '잡음 제거 강도 (0 끔 · 2 보통 · 3 강함: 숨소리·말소리·백색소음 무시)', 2, 0, 3, 1], ['오디오', 'noiseSup', 'bool', '브라우저 노이즈 제거 (피아노에는 끄는 것을 권장)', false],
   ['오디오', 'win', 'select', '분석 창 크기 (클수록 저음 정확·지연 증가)', 8192, [4096, 8192, 16384]], ['오디오', 'latencyMs', 'range', '마이크 입력 지연 보정(ms) — 지연 보정 도구로 측정', 60, 0, 400, 5],
   ['오디오', 'monitor', 'bool', '마이크 모니터링(스피커로 되돌려 듣기, 하울링 주의)', false], ['오디오', 'centsTol', 'range', '음정 정확도 허용 오차(센트, 자유 연주 표시)', 30, 5, 50, 5],
   ['오디오', 'volume', 'range', '출력 볼륨', 0.8, 0, 1, 0.05], ['오디오', 'timbre', 'select', '앱 음색', 'piano', ['piano', 'organ', 'strings', 'flute']], ['오디오', 'hearInput', 'bool', '가상 건반/컴퓨터 키보드 입력 소리 재생', true], ['오디오', 'midiSound', 'bool', 'MIDI 건반 입력 소리 재생 (디지털 피아노 자체 스피커 사용 시 끄기)', true], ['오디오', 'kbdInput', 'bool', '컴퓨터 키보드를 건반으로 사용 (A S D F… / W E T Y U…, Z·X 옥타브)', true],
@@ -1916,7 +1935,7 @@ function applySettings() {
   r.style.setProperty('--accent', S_('accent')); r.style.setProperty('--fs', S_('fontSize') + 'px'); r.style.setProperty('--btn', S_('btnSize') + 'px'); r.style.setProperty('--anim', S_('anim'));
   Audio_.setVol(S_('volume')); Input.setMonitor(S_('monitor'));
 }
-const micCfg = () => ({ deviceId: S_('deviceId') || undefined, noiseSup: S_('noiseSup'), win: +S_('win'), gainDb: S_('gainDb'), gate: S_('gate'), sens: S_('sens'), minConf: S_('minConf'), monitor: S_('monitor'), latencyMs: S_('latencyMs') });
+const micCfg = () => ({ deviceId: S_('deviceId') || undefined, noiseSup: S_('noiseSup'), win: +S_('win'), gainDb: S_('gainDb'), gate: S_('gate'), sens: S_('sens'), minConf: S_('minConf'), nf: S_('nf'), monitor: S_('monitor'), latencyMs: S_('latencyMs') });
 
 /* ── 알림 / 모달 / 접근성 ── */
 function toast(m) { const t = $('#toast'), d = document.createElement('div'); d.textContent = m; t.appendChild(d); setTimeout(() => d.remove(), 2800); if (S_('caption')) caption(m); }
@@ -2239,6 +2258,70 @@ function renderNav() {
   $$('#nav a').forEach(a => a.classList.toggle('act', a.dataset.v === cur || (a.dataset.v === '__more' && !NAV_MAIN.includes(cur))));
 }
 
+/* ───── 작품 공유 (소리 WAV · 악보 PNG · MIDI → 공유 시트/저장/문자) ───── */
+function renderWav(S) {
+  const sr = 22050, spb = 60 / (S.tempo || 100), ev = [], P = [[1, 1, 3.2], [2, .55, 4.5], [3, .32, 6], [4, .18, 8], [5, .1, 10], [6, .06, 12]];
+  S.staves.forEach(st => st.events.forEach(e => e.p.forEach(p => ev.push({ t: e.t * spb, d: Math.max(.12, e.d * spb), m: p + (st.transpose || 0) }))));
+  if (!ev.length) throw new Error('소리로 만들 음이 없습니다.');
+  const end = Math.max(...ev.map(e => e.t + e.d)) + 1.5; if (end > 600) throw new Error('10분보다 긴 작품은 소리 파일로 만들 수 없습니다.');
+  const out = new Float32Array(Math.ceil(end * sr));
+  for (const e of ev) {
+    const f0 = 440 * Math.pow(2, (e.m - 69) / 12), s0 = Math.floor(e.t * sr), len = Math.min(Math.floor((e.d + .5) * sr), Math.floor(3.5 * sr)), amp = .22 / Math.sqrt(1 + Math.max(0, e.m - 60) / 24);
+    for (let i = 0; i < len && s0 + i < out.length; i++) {
+      const t = i / sr; let v = 0; for (const [h, a, r] of P) { if (f0 * h < sr / 2.2) v += a * Math.sin(6.2831853 * f0 * h * t) * Math.exp(-r * t * (e.m > 72 ? 1.4 : 1)); }
+      out[s0 + i] += v * amp * Math.min(1, t / .004) * (t < e.d ? 1 : Math.exp(-(t - e.d) * 14));
+    }
+  }
+  let pk = 0; for (let i = 0; i < out.length; i++) pk = Math.max(pk, Math.abs(out[i])); const g = pk > 0 ? .9 / pk : 1;
+  const b = new DataView(new ArrayBuffer(44 + out.length * 2)), w = (o, s) => { for (let i = 0; i < s.length; i++) b.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); b.setUint32(4, 36 + out.length * 2, true); w(8, 'WAVEfmt '); b.setUint32(16, 16, true); b.setUint16(20, 1, true); b.setUint16(22, 1, true); b.setUint32(24, sr, true); b.setUint32(28, sr * 2, true); b.setUint16(32, 2, true); b.setUint16(34, 16, true); w(36, 'data'); b.setUint32(40, out.length * 2, true);
+  for (let i = 0; i < out.length; i++) b.setInt16(44 + i * 2, Math.max(-1, Math.min(1, out[i] * g)) * 32767, true);
+  return new Blob([b], { type: 'audio/wav' });
+}
+function scorePng(S) {
+  return new Promise((res, rej) => {
+    const r = renderScore(S, { width: 1000, scale: 1.1, showTempo: true, noteNames: false });
+    let svg = r.svg.replace(/>/, '><style>:root{--ink:#161616;--paper:#fff;--accent:#c98a00;--accent2:#2a6fdb;--bad:#d33;--good:#2a9d6d}text{font-family:Georgia,serif}</style><rect width="100%" height="100%" fill="#fff"/>');
+    const W = +(svg.match(/width="(\d+)"/) || [0, 1000])[1], H = +(svg.match(/height="(\d+)"/) || [0, 400])[1], img = new Image();
+    img.onload = () => { const c = document.createElement('canvas'), k = 1.5; c.width = W * k; c.height = (H + 40) * k; const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.scale(k, k); x.fillStyle = '#222'; x.font = 'bold 22px sans-serif'; x.textAlign = 'center'; x.fillText(S.title || '', W / 2, 26); x.drawImage(img, 0, 36); c.toBlob(b => b ? res(b) : rej(new Error('악보 그림 생성 실패')), 'image/png'); };
+    img.onerror = () => rej(new Error('악보 그림 생성 실패')); img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  });
+}
+async function openShare(o) {
+  let S = o.score;
+  if (!S && o.notes) { try { S = IO.notesToScore(o.notes, { tempo: o.tempo || 100, grid: .25 }); } catch (e) { return toast('공유할 악보를 만들지 못했습니다: ' + e.message); } }
+  if (!S) return toast('공유할 작품이 없습니다.');
+  S.title = o.title || S.title || 'PIANOVA 연주';
+  const base = S.title.replace(/[^\w가-힣 -]/g, '_').trim() || 'pianova', files = {};
+  const close = modal(`<h3>🎁 내 연주 공유하기</h3><p class="mute">「${esc(S.title)}」</p><div id="shS" class="mute">공유 파일을 만드는 중…</div>
+  <div style="margin:10px 0;line-height:2"><label><input type="checkbox" id="shW" checked> 🎧 소리 (WAV) — 카카오톡·문자로 바로 재생</label><br><label><input type="checkbox" id="shP" checked> 🖼 악보 그림 (PNG)</label><br><label><input type="checkbox" id="shM"> 🎹 MIDI 파일</label></div>
+  <div class="row" style="gap:8px;flex-wrap:wrap"><button class="pri" id="shGo" disabled>📤 공유하기 (카카오톡·문자 등)</button><button id="shSv" disabled>💾 파일로 저장</button><a id="shSms" href="#" style="text-decoration:none;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px">💬 문자 앱 열기</a><button id="shX">닫기</button></div>
+  <p class="mute" style="font-size:12px;margin-top:10px">「공유하기」를 누르면 휴대폰/PC의 공유 창이 열리고 카카오톡·문자·메일 등을 고를 수 있어요. 공유 창이 없는 브라우저에서는 파일이 저장되니 카카오톡·문자에서 "파일 첨부"로 보내세요.</p>`, (box, cl) => {
+    const $b = s => box.querySelector(s), st = $b('#shS');
+    $b('#shX').onclick = cl;
+    const pick = () => [['shW', 'wav'], ['shP', 'png'], ['shM', 'mid']].filter(([id]) => $b('#' + id).checked).map(([, k]) => files[k]).filter(Boolean);
+    const text = `PIANOVA에서 연주한 「${S.title}」 들어보세요 🎹`;
+    $b('#shSms').href = 'sms:?&body=' + encodeURIComponent(text + ' (파일은 따로 첨부해 주세요)');
+    $b('#shGo').onclick = async () => {
+      const fl = pick(); if (!fl.length) return toast('공유할 형식을 하나 이상 선택하세요.');
+      try {
+        if (navigator.canShare && navigator.canShare({ files: fl })) { await navigator.share({ files: fl, title: S.title, text }); toast('공유 창에서 보낼 곳을 선택하세요.'); }
+        else if (navigator.share) { await navigator.share({ title: S.title, text }); toast('이 기기는 파일 공유를 지원하지 않아 문장만 공유했어요. 「파일로 저장」 후 첨부하세요.'); }
+        else { fl.forEach(f => IO.download(f.name, f, f.type)); toast('공유 창을 지원하지 않는 브라우저예요. 파일을 저장했으니 카카오톡·문자에서 첨부하세요.'); }
+      } catch (e) { if (e.name !== 'AbortError') toast('공유 실패: ' + e.message + ' — 「파일로 저장」을 이용하세요.'); }
+    };
+    $b('#shSv').onclick = () => pick().forEach(f => IO.download(f.name, f, f.type));
+    setTimeout(async () => {
+      const errs = [];
+      try { files.wav = new File([renderWav(S)], base + '.wav', { type: 'audio/wav' }); } catch (e) { errs.push('소리: ' + e.message); $b('#shW').checked = false; $b('#shW').disabled = true; }
+      try { files.png = new File([await scorePng(S)], base + '.png', { type: 'image/png' }); } catch (e) { errs.push('악보 그림: ' + e.message); $b('#shP').checked = false; $b('#shP').disabled = true; }
+      try { files.mid = new File([IO.toMIDI(S)], base + '.mid', { type: 'audio/midi' }); } catch (e) { errs.push('MIDI: ' + e.message); $b('#shM').disabled = true; }
+      st.textContent = errs.length ? '일부 형식을 만들지 못했어요 — ' + errs.join(' / ') : '준비 완료! 보낼 형식을 고르세요.';
+      $b('#shGo').disabled = $b('#shSv').disabled = false; window.__shareFiles = files;
+    }, 30);
+  });
+}
+
 /* ═══ app_play.js ═══ */
 /* PIANOVA 연주 화면 — Player 컴포넌트, 레코더, 연주/스테이지 화면, 곡 라이브러리, 자유 연주, 퀴즈 엔진 */
 const MODES = [['listen', '감상 모드'], ['demo', '시범 연주 모드'], ['rh', '오른손만 연주'], ['lh', '왼손만 연주'], ['both', '양손 연주'], ['slow', '느린 연습 (50%)'], ['loop', '구간 반복'], ['mistakes', '틀린 부분 반복'], ['scoreonly', '악보만 보기'], ['rhythm', '리듬만 연습'], ['metro', '메트로놈 연습'], ['memo', '암보 연주'], ['perform', '실전 공연'], ['record', '녹음 및 분석']];
@@ -2265,7 +2348,8 @@ function analyzeRecording(notes) {
 function showAnalysis(a, notes, el) {
   if (!a) { el.innerHTML = '<div class="mute">기록된 음이 없습니다.</div>'; return; }
   el.innerHTML = `<table><tr><td>음 개수</td><td>${a.count} (오른손영역 ${a.rh} / 왼손영역 ${a.lh})</td></tr><tr><td>연주 길이</td><td>${a.dur.toFixed(1)}초</td></tr><tr><td>추정 템포(중앙 음 간격 기준)</td><td>♩≈${a.tempo}</td></tr><tr><td>박자 안정성</td><td>${a.steadiness.toFixed(0)}%</td></tr><tr><td>음역</td><td>${mName(a.lo)} ~ ${mName(a.hi)}</td></tr><tr><td>확인 필요(저신뢰) 음</td><td>${a.lowConf}</td></tr></table>
-  <div class="row" style="margin-top:8px"><button class="pri" id="toComp">작곡 스튜디오로 보내기 (자동 채보)</button></div>`;
+  <div class="row" style="margin-top:8px"><button class="pri" id="shRec">📤 공유하기 (카톡·문자)</button><button id="toComp">작곡 스튜디오로 보내기 (자동 채보)</button></div>`;
+  $('#shRec', el).onclick = () => openShare({ notes, tempo: clamp(a.tempo, 40, 200), title: '내 연주 ' + new Date().toISOString().slice(0, 10) });
   $('#toComp', el).onclick = async () => { const t = await ask('채보할 템포(BPM)', String(clamp(a.tempo, 40, 200))); if (!t) return; try { const S = IO.notesToScore(notes, { tempo: +t || 100, grid: 0.25 }); S.title = '녹음 채보 ' + new Date().toLocaleString(); const L = myComps(); L.unshift(S); Store.set('comps@' + UID, L); Game.S.counters.comps = (Game.S.counters.comps || 0) + 1; Game.save(); go('composer', S.id); } catch (e) { toast(e.message); } };
 }
 
@@ -2821,7 +2905,7 @@ Composer.edit = (main, id, task) => {
   <div class="row" style="margin-top:8px"><b>음표</b>${DUR.map(([s, d, n]) => `<button class="sm dbtn" data-d="${d}" title="${n}">${s} ${n}</button>`).join('')}<label class="row"><input type="checkbox" id="dt"> 점</label><label class="row"><input type="checkbox" id="rs"> 쉼표</label><label class="row">성부 <select id="vc" style="width:auto"><option value="1">1 (위)</option><option value="2">2 (아래)</option><option value="3">3</option></select></label><label class="row">잇단 <select id="tu" style="width:auto"><option value="">없음</option><option value="3,2">3잇단 (셋잇단)</option><option value="5,4">5잇단</option><option value="6,4">6잇단</option><option value="7,4">7잇단</option></select></label><label class="row">변화표 <select id="ac" style="width:auto"><option value="">조표 따름</option><option value="#">♯</option><option value="b">♭</option><option value="n">♮</option></select></label><span class="mute">악보를 클릭해 입력 · 음표 클릭으로 선택(Shift로 다중)</span></div>
   <div class="row" style="margin-top:8px"><b>편집</b><button class="sm" id="del">삭제</button><button class="sm" id="up">↑½</button><button class="sm" id="dn">↓½</button><button class="sm" id="uo">↑옥타브</button><button class="sm" id="do">↓옥타브</button><button class="sm" id="sd">길이=현재음표</button><button class="sm" id="sv">성부=현재성부</button><button class="sm" id="ti2">붙임줄</button><button class="sm" id="dy">셈여림</button><button class="sm" id="cs2">코드기호</button><button class="sm" id="cp">복사</button><button class="sm" id="ps">붙여넣기</button><button class="sm" id="sa">전체선택</button></div>
   <div class="row" style="margin-top:8px"><button class="pri" id="pl">▶ 재생</button><button id="st">■ 정지</button><label class="row"><input type="checkbox" id="si"> 건반/MIDI 스텝 입력</label><button id="rc">● 연주 녹음 → 자동 채보</button><span id="rst" class="mute"></span></div>
-  <div class="row" style="margin-top:8px"><b>내보내기</b><button class="sm" id="xj">JSON</button><button class="sm" id="xs">PIANOVA JS</button><button class="sm" id="xm">MIDI</button><button class="sm" id="xx">MusicXML</button><button class="sm" id="xp">PDF(인쇄)</button><button class="sm" id="im">가져오기(현재 곡 대체)</button><input type="file" id="fi" hidden accept=".js,.json,.mid,.midi,.xml,.musicxml"></div></div>
+  <div class="row" style="margin-top:8px"><button class="sm pri" id="xsh">📤 공유하기 (카톡·문자)</button><b>내보내기</b><button class="sm" id="xj">JSON</button><button class="sm" id="xs">PIANOVA JS</button><button class="sm" id="xm">MIDI</button><button class="sm" id="xx">MusicXML</button><button class="sm" id="xp">PDF(인쇄)</button><button class="sm" id="im">가져오기(현재 곡 대체)</button><input type="file" id="fi" hidden accept=".js,.json,.mid,.midi,.xml,.musicxml"></div></div>
   <div class="card"><div class="sheet" id="cs" style="max-height:480px;cursor:crosshair"></div></div><div class="sp1"></div><div class="card"><div id="kbwrap"><div id="kbh"></div></div></div></div>`;
   const kb = Keyboard($('#kbh'), { lo: 36, hi: 96, minKeyPx: 20 });
   const ku = Input.on(e => { if (e.type === 'on') kb.mark(e.midi, 'on', true); else if (e.type === 'off') kb.mark(e.midi, 'on', false); if (e.type === 'on' && stepIn) stepInput(e.midi); });
@@ -2865,6 +2949,7 @@ Composer.edit = (main, id, task) => {
   $('#rc').onclick = async () => { if (!Recorder.on) { await ensureInputForRecording(); Audio_.ensure(); const c = Audio_.ensure(), spb = 60 / S.tempo; for (let i = 0; i < 300; i++) Audio_.click(c.currentTime + .2 + i * spb, i % beatsPerBar(S) === 0, .5); Recorder.start(); $('#rc').textContent = '■ 녹음 종료'; $('#rst').textContent = '메트로놈에 맞춰 연주하세요 (마이크가 켜져 있으면 마이크 입력도 기록됩니다)'; return; } const n = Recorder.stop(); $('#rc').textContent = '● 연주 녹음 → 자동 채보'; $('#rst').textContent = ''; if (!n.length) return toast('기록된 음이 없습니다.'); try { const T = IO.notesToScore(n, { tempo: S.tempo, grid: .25, tsig: S.tsig }); if (!await yesno('녹음을 채보하여 현재 악보를 대체할까요? (↶로 되돌릴 수 있습니다)')) return; mut(() => { S.staves = T.staves; S.lowConf = T.lowConf; }); toast(T.lowConf && T.lowConf.length ? `채보 완료 — 확인이 필요한 음 ${T.lowConf.length}개가 있습니다(마이크 신뢰도 낮음).` : '채보 완료'); } catch (er) { toast(er.message); } };
   // 내보내기
   const fn = ext => (S.title || 'pianova').replace(/[^\w가-힣 -]/g, '_') + ext, tryX = f => { try { f(); } catch (e) { toast(e.message); } };
+  $('#xsh').onclick = () => openShare({ score: S, title: S.title });
   $('#xj').onclick = () => tryX(() => IO.download(fn('.json'), IO.toJSON(S), 'application/json')); $('#xs').onclick = () => tryX(() => IO.download(fn('.pianova.js'), IO.toPianovaJS(S), 'text/javascript'));
   $('#xm').onclick = () => tryX(() => IO.download(fn('.mid'), IO.toMIDI(S), 'audio/midi')); $('#xx').onclick = () => tryX(() => IO.download(fn('.musicxml'), IO.toMusicXML(S), 'application/vnd.recordare.musicxml+xml')); $('#xp').onclick = () => tryX(() => IO.printPDF(S));
   $('#im').onclick = () => $('#fi').click(); $('#fi').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const T = await importFile(f); snap(); T.id = S.id; Object.keys(S).forEach(k => delete S[k]); Object.assign(S, mkScore(T)); sel.clear(); draw(); $('#ti').value = S.title; toast('가져왔습니다 — 안전한 데이터 파서로 읽었습니다.'); } catch (er) { toast(er.message); } };
