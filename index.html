@@ -1264,7 +1264,7 @@ function gradeOf(acc, errors, diff, passAcc) {
 /* 판정기: steps = [{t(sec), notes:[{p,hand,si,ei}]}] — 입력은 addInput으로 하나씩 */
 class Matcher {
   constructor(steps, o = {}) {
-    this.o = Object.assign({ tolMic: 0.3, tolMidi: 0.18, ignorePitch: false, octaveLoose: false, allow: 0 }, o);
+    this.o = Object.assign({ tolMic: 0.45, tolMidi: 0.28, ignorePitch: false, octaveLoose: false, allow: 0 }, o);
     this.steps = steps.map(s => ({ t: s.t, d: s.d, notes: s.notes.map(n => ({ ...n, hit: false, dt: 0, dur: null })) }));
     this.extras = []; this.inputs = [];
   }
@@ -1295,7 +1295,7 @@ class Matcher {
       let m = 0;
       s.notes.forEach(n => {
         const h = n.hand || 'rh'; (perHand[h] = perHand[h] || { n: 0, hit: 0 }).n++;
-        if (n.hit) { hits++; perHand[h].hit++; const tl = this.o.tolMic; hitScore += 1 - 0.3 * Math.min(1, Math.abs(n.dt) / (n.inp && n.inp.src === 'mic' ? this.o.tolMic : this.o.tolMidi)) ** 2; dts.push(n.dt); }
+        if (n.hit) { hits++; perHand[h].hit++; const tl = this.o.tolMic; hitScore += 1 - 0.12 * Math.min(1, Math.abs(n.dt) / (n.inp && n.inp.src === 'mic' ? this.o.tolMic : this.o.tolMidi)) ** 2; dts.push(n.dt); }
         else if (s.t + this.tol('mic') < now_) { misses++; m++; }
       });
       stepRes.push({ t: s.t, miss: m, ok: m === 0 });
@@ -1316,7 +1316,7 @@ class Matcher {
 /* 러너 */
 class Runner {
   constructor(S, o, ui) {
-    this.S = S; this.o = Object.assign({ hands: 'both', scale: 1, mode: 'timed', metronome: true, countIn: null, from: 0, to: null, ignorePitch: false, backing: true, tolMic: 0.3, tolMidi: 0.18, latency: 0 }, o); this.ui = ui || {};
+    this.S = S; this.o = Object.assign({ hands: 'both', scale: 1, mode: 'timed', metronome: true, countIn: null, from: 0, to: null, ignorePitch: false, backing: true, tolMic: 0.45, tolMidi: 0.28, latency: 0 }, o); this.ui = ui || {};
     this.spb = 60 / (this.o.tempo || S.tempo) / this.o.scale; this.running = false; this.res = null;
     this.steps = scoreSteps(S, this.o.hands).filter(s => s.t >= this.o.from - 1e-6 && (this.o.to == null || s.t < this.o.to - 1e-6));
     this.end = this.o.to ?? scoreBeats(S); this.bpm = beatsPerBar(S);
@@ -1333,7 +1333,7 @@ class Runner {
   mark(n, st) { const k = this.key(n); if (this.marks[k] === 'bad' && st === 'ok') return; this.marks[k] = st; this.ui.onMark && this.ui.onMark(k, st); }
   start() {
     const o = this.o, c = Audio_.ensure(); this.running = true; this.inputs = [];
-    if (o.mode === 'wait') return this.startWait();
+    if (o.mode === 'wait' || o.mode === 'pace') return this.startWait();
     const cin = o.mode === 'listen' ? 0 : (o.countIn ?? this.bpm); this.cin = cin;
     this.t0 = now() + 0.15 + cin * this.spb; const aT0 = (c ? c.currentTime : 0) + (this.t0 - now());
     this.matcher = new Matcher(this.steps.map(s => ({ t: this.t0 + (s.t - o.from) * this.spb, d: s.d, notes: s.notes })), { tolMic: o.tolMic, tolMidi: o.tolMidi, ignorePitch: o.ignorePitch, octaveLoose: o.octaveLoose, allow: o.allow });
@@ -1349,17 +1349,18 @@ class Runner {
     this.ui.onStatus && this.ui.onStatus(o.mode === 'listen' ? '재생 중' : '카운트 인…');
   }
   startWait() {
-    this.idx = 0; this.pressed = new Set(); this.waitWrong = 0; this.stepErr = false; this.startT = now(); this.errs = 0; this.corr = 0; this.log = []; this.badBeats = [];
-    this.unsub = Input.on(e => this.onInput(e)); this.showStep();
+    this.idx = 0; this.skipped = 0; this.times = []; this.stepErrs = []; this.stepT = undefined; this.stepErrN = 0; this.lastOk = null; this.pressed = new Set(); this.waitWrong = 0; this.stepErr = false; this.startT = now(); this.errs = 0; this.corr = 0; this.log = []; this.badBeats = [];
+    this.unsub = Input.on(e => this.onInput(e)); this.ui.onStatus && this.ui.onStatus('음을 칠 때까지 기다립니다 — 내 속도로 연주하세요'); this.showStep();
   }
   showStep() { const s = this.steps[this.idx]; if (!s) return this.finishWait(); this.pressed = new Set(); this.stepErr = false; this.ui.onTarget && this.ui.onTarget(s.notes.map(n => n.p), s.t); this.ui.onCursor && this.ui.onCursor(s.t); s.notes.forEach(n => this.ui.onMark && this.ui.onMark(this.key(n), 'cur')); }
   onInput(e) {
     if (!this.running) return;
     if (e.type !== 'on') { if (e.type === 'off' && this.matcher) { const i = [...this.matcher.inputs].reverse().find(x => x.midi === e.midi && x.off === undefined); if (i) { i.off = e.time; if (i.matched) i.matched.dur = e.time - i.time; } } return; }
-    if (this.o.mode === 'wait') {
+    if (this.o.mode === 'wait' || this.o.mode === 'pace') {
       const s = this.steps[this.idx]; if (!s) return; const n = s.notes.find(x => x.p === e.midi && !this.pressed.has(x.p)); const gh = !n && this.ghost(e); this.seen(e);
-      if (n) { this.pressed.add(n.p); this.corr++; this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); if (this.pressed.size === s.notes.length) { s.notes.forEach(x => this.mark(x, this.stepErr ? 'bad' : 'ok')); if (this.stepErr) this.badBeats.push(s.t); this.idx++; setTimeout(() => this.running && this.showStep(), 120); } }
-      else if (!this.pressed.has(e.midi) && !gh) { this.errs++; this.stepErr = true; this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi); }
+      if (n && e.src === 'mic' && this.lastOk && this.lastOk.m === e.midi && e.time - this.lastOk.t < 0.2) return; // 마이크 같은 음 중복 인식 무시
+      if (n) { if (this.stepT === undefined) this.stepT = e.time; this.lastOk = { m: e.midi, t: e.time }; this.pressed.add(n.p); this.corr++; this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); if (this.pressed.size === s.notes.length) { s.notes.forEach(x => this.mark(x, this.stepErr ? 'bad' : 'ok')); if (this.stepErr) this.badBeats.push(s.t); this.times[this.idx] = this.stepT; this.stepT = undefined; this.stepErrs[this.idx] = this.stepErrN || 0; this.stepErrN = 0; this.idx++; this.showStep(); } }
+      else if (!this.pressed.has(e.midi) && !gh) { this.errs++; this.stepErrN = (this.stepErrN || 0) + 1; this.stepErr = true; this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi); }
       this.ui.onProgress && this.ui.onProgress(this.idx / this.steps.length, this.errs);
       return;
     }
@@ -1368,7 +1369,7 @@ class Runner {
     if (inp.time < this.t0 - this.spb * 1.2) return;  // 카운트인 이전 입력 무시
     inp.soft = this.ghost(e); this.seen(e);
     const r = this.matcher.addInput(inp); if (r.ignored) return;
-    if (r.ok) { r.step.notes.forEach(n => { if (n.hit) this.mark(n, 'ok'); }); this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); this.ui.onJudge && this.ui.onJudge(Math.abs(r.dt) < 0.06 ? 'PERFECT' : Math.abs(r.dt) < 0.12 ? 'GREAT' : r.dt < 0 ? 'EARLY' : 'LATE'); }
+    if (r.ok) { r.step.notes.forEach(n => { if (n.hit) this.mark(n, 'ok'); }); this.ui.onFlash && this.ui.onFlash(e.midi, 'ok'); this.ui.onJudge && this.ui.onJudge(Math.abs(r.dt) < 0.12 ? 'PERFECT' : Math.abs(r.dt) < 0.22 ? 'GREAT' : r.dt < 0 ? 'EARLY' : 'LATE'); }
     else { this.ui.onFlash && this.ui.onFlash(e.midi, 'bad'); this.ui.onWrong && this.ui.onWrong(e.midi, r.oct); this.ui.onJudge && this.ui.onJudge(r.oct ? 'OCTAVE' : 'WRONG'); }
   }
   tick() {
@@ -1387,7 +1388,46 @@ class Runner {
     }
     this.raf = requestAnimationFrame(() => this.tick());
   }
+  /* 대기형(wait/pace) 진행 중 현재 음을 건너뜀 — 막혔을 때 빠져나오는 용도. 누락으로 기록됨 */
+  skipStep() {
+    if (!this.running || !(this.o.mode === 'wait' || this.o.mode === 'pace')) return false; const s = this.steps[this.idx]; if (!s) return false;
+    const left = s.notes.filter(x => !this.pressed.has(x.p)).length; this.skipped = (this.skipped || 0) + left; this.stepErr = true; s.notes.forEach(x => { if (!this.pressed.has(x.p)) this.mark(x, 'bad'); });
+    this.badBeats.push(s.t); this.times[this.idx] = NaN; this.stepT = undefined; this.stepErrN = 0; this.idx++; this.showStep(); return true;
+  }
+  /* 플레이어 속도 기준 리듬 평가: 각 음을 칠 때까지 기다린 뒤, 음과 음 사이에 걸린 시간을 악보의 박 간격과 비교.
+     곡 전체가 아니라 주변 몇 음의 '자기 템포'를 기준으로 삼아 점점 빨라지거나 느려져도 감점하지 않음. */
+  paceRhythm() {
+    const st = this.steps, T = this.times, iv = [];
+    for (let i = 0; i + 1 < st.length; i++) { const db = st[i + 1].t - st[i].t, dt = T[i + 1] - T[i]; if (db > 1e-6 && isFinite(dt) && dt > 0) iv.push({ i, db, dt, r: dt / db }); }
+    if (iv.length < 2) return { rhythm: 100, prop: 100, steady: 100, tempoFit: 100, bpm: null, given: null, hes: [], n: iv.length };
+    const med = a => { const s = a.slice().sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+    let sum = 0; const hes = [];
+    iv.forEach((x, k) => {
+      const loc = med(iv.slice(Math.max(0, k - 5), k + 6).map(y => y.r)), dev = Math.abs(Math.log(x.r / loc));
+      sum += dev <= 0.3 ? 1 : Math.max(0, 1 - (dev - 0.3) / 0.6); // ±35% 안이면 만점, 약 2.4배 차이면 0점
+      if (x.r > loc * 2.4 && x.dt > 1.5) hes.push(st[x.i + 1].t); // 오래 머뭇거린 지점
+    });
+    const prop = 100 * sum / iv.length;
+    /* 일정함: 처음 연주한 속도(첫 6구간 중앙값) 대비 얼마나 벗어났나 — 점점 빨라지거나 느려지면 감점 */
+    const r0 = med(iv.slice(0, 3).map(y => y.r)); let s2 = 0;
+    iv.forEach(x => { const d = Math.abs(Math.log(x.r / r0)); s2 += d <= 0.22 ? 1 : Math.max(0, 1 - (d - 0.22) / 0.5); });
+    const steady = 100 * s2 / iv.length;
+    /* 주어진 템포와의 차이: 전체 중앙값 속도 vs 곡의 지정 템포 (±40% 안이면 만점, 약 3배 차이면 0점) */
+    const gm = med(iv.map(y => y.r)), rg = this.spb, dg = Math.abs(Math.log(gm / rg));
+    const tempoFit = 100 * (dg <= 0.34 ? 1 : Math.max(0, 1 - (dg - 0.34) / 0.55));
+    const rhythm = 0.3 * prop + 0.4 * steady + 0.3 * tempoFit;
+    return { rhythm, prop, steady, tempoFit, bpm: Math.round(60 / gm), given: Math.round(60 / rg), hes, n: iv.length };
+  }
   finishWait() {
+    if (this.o.mode === 'pace') {
+      const N = this.steps.reduce((a, s) => a + s.notes.length, 0), pr = this.paceRhythm(), secs = now() - this.startT;
+      const sk = this.skipped || 0, base = N ? clamp(100 * (N - sk) / (N + this.errs * 0.5), 0, 100) : 0, acc = base * (0.7 + 0.3 * pr.rhythm / 100);
+      const perHand = {}; this.steps.forEach(s => s.notes.forEach(n => { const h = n.hand || 'rh'; (perHand[h] = perHand[h] || { n: 0, hit: 0 }); perHand[h].n++; perHand[h].hit++; }));
+      const bad = new Set(this.badBeats); pr.hes.forEach(b => bad.add(b));
+      this.res = { mode: 'pace', n: N, hits: N - sk, misses: sk, extras: this.errs, errors: this.errs + sk, wrong: this.errs, acc, pitchAcc: base, rhythm: pr.rhythm, rProp: pr.prop, rSteady: pr.steady, rTempo: pr.tempoFit, givenBpm: pr.given, paceBpm: pr.bpm, hesitations: pr.hes.length, secs, perHand, stepRes: [], badBeats: [...bad], from: this.o.from, to: this.end, bpm: this.bpm };
+      this.stop(); this.ui.onDone && this.ui.onDone(this.res); return;
+    }
+
     const secs = now() - this.startT, N = this.steps.reduce((a, s) => a + s.notes.length, 0), acc = N ? 100 * N / (N + this.errs) : 0;
     this.res = { mode: 'wait', n: N, hits: N, errors: this.errs, acc, secs, wrong: this.errs, misses: 0, perHand: {}, stepRes: [], badBeats: this.badBeats, from: this.o.from, to: this.end, bpm: this.bpm };
     this.stop(); this.ui.onDone && this.ui.onDone(this.res);
@@ -2041,7 +2081,7 @@ const SET = [
   ['오디오', 'volume', 'range', '출력 볼륨', 0.8, 0, 1, 0.05], ['오디오', 'timbre', 'select', '앱 음색', 'piano', ['piano', 'organ', 'strings', 'flute']], ['오디오', 'hearInput', 'bool', '가상 건반/컴퓨터 키보드 입력 소리 재생', true], ['오디오', 'midiSound', 'bool', 'MIDI 건반 입력 소리 재생 (디지털 피아노 자체 스피커 사용 시 끄기)', true], ['오디오', 'kbdInput', 'bool', '컴퓨터 키보드를 건반으로 사용 (A S D F… / W E T Y U…, Z·X 옥타브)', true],
   ['연주', 'practiceScale', 'range', '기본 연습 템포(%)', 100, 25, 200, 5], ['연주', 'autoTempo', 'bool', '자동 템포 조절 (통과하면 +5%, 실패하면 -10%)', false], ['연주', 'handSplit', 'bool', '왼손·오른손 분리 색상 표시', true],
   ['연주', 'pedal', 'bool', '페달 인식 (MIDI CC64 입력 표시)', true], ['연주', 'octaveStrict', 'bool', '옥타브 판정 엄격 (끄면 같은 음이름이면 인정)', true], ['연주', 'durJudge', 'bool', '음표 길이 판정 (참고 지표를 점수에 반영)', false],
-  ['연주', 'tolMic', 'range', '리듬 허용 오차 — 마이크(초)', 0.3, 0.1, 0.6, 0.02], ['연주', 'tolMidi', 'range', '리듬 허용 오차 — MIDI/키보드(초)', 0.18, 0.05, 0.4, 0.01], ['연주', 'allowErr', 'range', '오답 허용 개수 (이 수만큼 누락을 무시)', 0, 0, 10, 1], ['연주', 'countIn', 'bool', '카운트 인(한 마디) 사용', true], ['연주', 'metro', 'bool', '메트로놈 기본 켜기', true], ['연주', 'lockSeq', 'bool', '스테이지 순서 잠금 (끄면 모든 스테이지 열림)', true],
+  ['연주', 'paceJudge', 'bool', '내 속도에 맞춰 진행 (음을 칠 때까지 기다리고, 걸린 시간으로 리듬 평가)', true], ['연주', 'tolMic', 'range', '고정 템포 모드 리듬 허용 오차 — 마이크(초)', 0.45, 0.1, 0.8, 0.02], ['연주', 'tolMidi', 'range', '고정 템포 모드 리듬 허용 오차 — MIDI/키보드(초)', 0.28, 0.05, 0.5, 0.01], ['연주', 'allowErr', 'range', '오답 허용 개수 (이 수만큼 누락을 무시)', 0, 0, 10, 1], ['연주', 'countIn', 'bool', '카운트 인(한 마디) 사용', true], ['연주', 'metro', 'bool', '메트로놈 기본 켜기', true], ['연주', 'lockSeq', 'bool', '스테이지 순서 잠금 (끄면 모든 스테이지 열림)', true],
   ['악보', 'scoreScale', 'range', '악보 크기', 1, 0.7, 1.6, 0.05], ['악보', 'perSystem', 'select', '한 줄당 마디 수 (0=자동)', 0, [0, 2, 3, 4, 6]], ['악보', 'followCursor', 'bool', '연주 위치로 악보 자동 이동', true], ['악보', 'hiMeasure', 'bool', '현재 마디 강조', true],
   ['악보', 'handColors', 'bool', '손별 음표 색상 (오른손 파랑 / 왼손 초록)', false], ['악보', 'solfege', 'bool', '계이름(도레미) 표시', false], ['악보', 'fingering', 'bool', '손가락 번호 표시', true], ['악보', 'showChords', 'bool', '코드 기호 표시', true],
   ['게임', 'showXP', 'bool', 'XP 획득량 표시', true], ['게임', 'autoCP', 'bool', '실패 시 마지막 체크포인트로 자동 이동', true], ['게임', 'instantRetry', 'bool', '실패 후 바로 재도전 버튼 강조', true], ['게임', 'dailyGoal', 'range', '하루 학습 목표(분)', 20, 5, 180, 5], ['게임', 'streakNote', 'bool', '연속 학습 알림(앱 안 배너)', true], ['게임', 'questNote', 'bool', '퀘스트 완료 알림', true],
@@ -2573,9 +2613,10 @@ Views.play = (main, arg) => {
   const ctl = {
     stopAll() { Pl.stop(); running = false; loopOn = false; }
   }; let loopOn = false;
+  const JM = () => S_('paceJudge') ? 'pace' : 'timed'; // 기본: 플레이어 속도에 맞춰 기다리는 판정
   const modeOpts = MODES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
   $('#ctl').innerHTML = `${stage ? `<div class="row" style="width:100%;gap:8px"><span class="mute" style="font-size:.85em">연습 방법</span><button id="bDemo">▶ 시범</button><button id="bWait">⏸ 대기 연습</button><button id="bCP" class="pri">🚩 체크포인트 도전</button><button id="bFinal" class="good">🏁 최종 시험</button></div>` : ''}
-  <div class="row" style="width:100%;gap:8px"><label class="row">모드 <select id="mode" style="width:auto">${modeOpts}</select></label><button id="bStart" class="pri">▶ 시작</button><button id="bStop">■ 정지</button>${type === 'song' || type === 'comp' ? `<button class="sm ghost" id="bFav">${Game.S.fav.includes(id) ? '★' : '☆'}</button>` : ''}<span style="flex:1"></span><button class="sm ghost" id="bOpt">⚙ 연습 옵션</button></div>
+  <div class="row" style="width:100%;gap:8px"><label class="row">모드 <select id="mode" style="width:auto">${modeOpts}</select></label><button id="bStart" class="pri">▶ 시작</button><button id="bStop">■ 정지</button><button id="bSkipN" class="sm" hidden title="막혔을 때 현재 음을 건너뜁니다 (누락으로 기록)">⏭ 이 음 건너뛰기</button>${type === 'song' || type === 'comp' ? `<button class="sm ghost" id="bFav">${Game.S.fav.includes(id) ? '★' : '☆'}</button>` : ''}<span style="flex:1"></span><button class="sm ghost" id="bOpt">⚙ 연습 옵션</button></div>
   <div id="opts" hidden class="row" style="width:100%;gap:14px;padding-top:10px;border-top:1px solid var(--line)"><label class="row">손 <select id="hands" style="width:auto"><option value="both">양손</option><option value="rh">오른손</option><option value="lh">왼손</option></select></label><label class="row">템포 <input type="range" id="tp" min="25" max="200" step="5" value="${Math.round(scale * 100)}" style="width:110px"> <b id="tpv">${Math.round(scale * 100)}%</b></label><label class="row"><input type="checkbox" id="metro" ${S_('metro') ? 'checked' : ''}> 메트로놈</label><span id="loopbox" style="display:none" class="row">마디 <input type="number" id="l1" min="1" max="${nM}" value="1" style="width:64px"> – <input type="number" id="l2" min="1" max="${nM}" value="${Math.min(nM, 4)}" style="width:64px"></span><button class="sm ghost" id="bFull">건반 88키</button></div>`;
   $('#bOpt').onclick = () => { const o = $('#opts'); o.hidden = !o.hidden; $('#bOpt').classList.toggle('pri', !o.hidden); };
   $('#tp').oninput = e => { scale = +e.target.value / 100; $('#tpv').textContent = e.target.value + '%'; };
@@ -2590,13 +2631,14 @@ Views.play = (main, arg) => {
   function resultModal(res, kind, o = {}) {
     const bm = [...new Set((res.badBeats || []).map(b => Math.floor(b / bpm + 1e-6) + 1))].sort((a, b) => a - b), g = res.grade, fail = g === 'FAIL', ph = res.perHand || {};
     const hand = h => ph[h] && ph[h].n ? Math.round(100 * ph[h].hit / ph[h].n) + '%' : '-';
-    const tm = res.timingMean !== undefined ? `${res.timingMean > 0 ? '+' : ''}${Math.round(res.timingMean * 1000)}ms (${res.timingMean > 0.03 ? '늦는 경향' : res.timingMean < -0.03 ? '빠른 경향' : '정확'}) ±${Math.round(res.timingSD * 1000)}ms` : '-';
+    const pace = res.mode === 'pace';
+    const tm = pace ? `리듬 정확도 ${Math.round(res.rhythm)}% (음표 비율 ${Math.round(res.rProp)} · 속도 일정함 ${Math.round(res.rSteady)} · 지정 템포 일치 ${Math.round(res.rTempo)})${res.paceBpm ? ' · 내 연주 속도 ♩≈' + res.paceBpm + (res.givenBpm ? ' (지정 ♩=' + res.givenBpm + ')' : '') : ''}${res.hesitations ? ' · 오래 머뭇거린 곳 ' + res.hesitations + '군데' : ''}` : res.timingMean !== undefined ? `${res.timingMean > 0 ? '+' : ''}${Math.round(res.timingMean * 1000)}ms (${res.timingMean > 0.03 ? '늦는 경향' : res.timingMean < -0.03 ? '빠른 경향' : '정확'}) ±${Math.round(res.timingSD * 1000)}ms` : '-';
     modal(`<h2 class="judge ${g}" style="font-size:2.4em">${g || (res.mode === 'wait' ? '대기 연습 완료' : '')}</h2><div class="center" style="text-align:center"><div class="big ${gradeColor(g)}">${res.acc.toFixed(1)}%</div><div class="mute">${kind === 'final' ? '최종 시험' : kind === 'cp' ? '체크포인트 ' + (o.sec + 1) : '연습'} · 통과 기준 ${kind === 'cp' ? thrSec : thrFinal}%</div></div><div class="sp1"></div>
-    <table><tr><td>음 개수 / 맞음</td><td>${res.n} / ${res.hits}</td></tr><tr><td>오류</td><td>누락 ${res.misses} · 틀린/추가 음 ${res.extras ?? res.wrong}${res.octaveErr ? ' (옥타브 오류 ' + res.octaveErr + ')' : ''}</td></tr>
-    <tr><td>오른손 / 왼손 정확도</td><td>${hand('rh')} / ${hand('lh')}</td></tr><tr><td>타이밍</td><td>${tm}</td></tr>${res.durRatio != null ? `<tr><td>음 길이(참고)</td><td>악보 대비 ${(res.durRatio * 100).toFixed(0)}%</td></tr>` : ''}<tr><td>다시 볼 마디</td><td>${bm.length ? bm.join(', ') : '없음'}</td></tr></table>
+    <table><tr><td>음 개수 / 맞음</td><td>${res.n} / ${res.hits}</td></tr><tr><td>오류</td><td>${pace && !res.misses ? '' : '누락 ' + res.misses + ' · '}틀린/추가 음 ${res.extras ?? res.wrong}${res.octaveErr ? ' (옥타브 오류 ' + res.octaveErr + ')' : ''}</td></tr>
+    <tr><td>오른손 / 왼손 정확도</td><td>${hand('rh')} / ${hand('lh')}</td></tr><tr><td>${pace ? '리듬' : '타이밍'}</td><td>${tm}</td></tr>${res.durRatio != null ? `<tr><td>음 길이(참고)</td><td>악보 대비 ${(res.durRatio * 100).toFixed(0)}%</td></tr>` : ''}<tr><td>다시 볼 마디</td><td>${bm.length ? bm.join(', ') : '없음'}</td></tr></table>
     ${res.xp ? `<p class="ok">+${res.xp} XP</p>` : ''}${o.extra || ''}<div class="sp1"></div><div class="row"><button class="pri" id="m1">${fail ? '다시 도전' : o.next ? '다음 ▶' : '확인'}</button>${fail && bm.length ? '<button id="m2">🐢 틀린 구간 느리게 연습</button>' : ''}${stage && !fail && kind === 'final' ? '<button id="m3">다음 스테이지</button>' : ''}<button id="m4">닫기</button></div>`, (b, close) => {
       $('#m1', b).onclick = () => { close(); if (fail) o.retry && o.retry(); else o.next && o.next(); }; $('#m4', b).onclick = close;
-      const m2 = $('#m2', b); if (m2) m2.onclick = () => { close(); mistakeRanges = null; const m = bm.map(x => x - 1); const a = Math.max(0, Math.min(...m) - 0), z = Math.min(nM - 1, Math.max(...m)); setTimeout(() => runRange(a * bpm, (z + 1) * bpm, { scale: Math.min(scale, 0.7), mode: 'timed' }, null), 200); };
+      const m2 = $('#m2', b); if (m2) m2.onclick = () => { close(); mistakeRanges = null; const m = bm.map(x => x - 1); const a = Math.max(0, Math.min(...m) - 0), z = Math.min(nM - 1, Math.max(...m)); setTimeout(() => runRange(a * bpm, (z + 1) * bpm, { scale: Math.min(scale, 0.7), mode: JM() }, null), 200); };
       const m3 = $('#m3', b); if (m3) m3.onclick = () => { close(); const i = STAGES.indexOf(stage), n = STAGES[i + 1]; n ? go('play', 'stage/' + n.id) : go('academy'); };
     });
   }
@@ -2608,13 +2650,13 @@ Views.play = (main, arg) => {
     Pl.run(Object.assign({ from, to, hands: curHands() === 'both' ? 'both' : curHands() }, base(), o), res => {
       running = false; if (res.mode === 'listen') { onDone && onDone(res); $('#st').textContent = '재생 완료'; return; }
       if (res.mode === 'timed') { res.grade = gradeOf(res.acc, res.errors, diff, o.kind === 'cp' ? thrSec : thrFinal); if (S_('durJudge') && res.durRatio != null && res.durRatio < 0.5) res.acc = Math.max(0, res.acc - clamp((0.6 - res.durRatio) * 20, 0, 10)); }
-      else res.grade = gradeOf(res.acc, res.errors, diff, thrFinal);
+      else res.grade = gradeOf(res.acc, res.errors, diff, o.kind === 'cp' ? thrSec : thrFinal);
       lastRes = res; $('#st').textContent = '완료'; $('#jg').textContent = res.grade; $('#jg').className = 'judge ' + res.grade; say(res.grade === 'FAIL' ? '아쉽네요, 다시 도전해 보세요' : '통과! ' + res.acc.toFixed(0) + '퍼센트'); onDone && onDone(res);
     });
   }
   function startCP(i) {
     if (running) return; const s = secs[i]; const tries = () => { if (rec) { rec.tries++; Game.save(); } };
-    runRange(s.from, s.to, { mode: 'timed', kind: 'cp' }, res => {
+    runRange(s.from, s.to, { mode: JM(), kind: 'cp' }, res => {
       tries(); const pass = res.acc >= thrSec; recordStats(res, 'cp'); adjustTempo(pass);
       if (pass) { if (rec && rec.cp < i + 1) { rec.cp = i + 1; Game.save(); } const xp = Game.addXP(XPB[diff] * 0.25 * Math.pow(res.acc / 100, 2), '체크포인트'); res.xp = xp; drawLeft();
         resultModal(Object.assign(res, { grade: res.grade === 'FAIL' ? 'PASS' : res.grade }), 'cp', { sec: i, next: i + 1 < secs.length ? () => startCP(i + 1) : () => toast('모든 체크포인트를 통과했습니다! 최종 시험에 도전하세요.') }); }
@@ -2623,7 +2665,7 @@ Views.play = (main, arg) => {
   }
   function startFinal() {
     if (running) return; scale = 1; $('#tp').value = 100; $('#tpv').textContent = '100%';
-    runRange(0, total, { mode: 'timed', kind: 'final', scale: 1, hands: 'both' }, res => {
+    runRange(0, total, { mode: JM(), kind: 'final', scale: 1, hands: 'both' }, res => {
       if (rec) { rec.tries++; } const pass = res.grade !== 'FAIL'; recordStats(res, 'final'); adjustTempo(pass);
       if (pass) { const first = rec && !rec.cleared; res.xp = Game.addXP(xpFor(res, res.grade, first), stage ? '스테이지 클리어' : '곡 완주');
         if (rec) { rec.cleared = true; rec.best = Math.max(rec.best, res.acc); const rk = { PERFECT: 3, GREAT: 2, PASS: 1, '': 0 }; if ((rk[res.grade] || 0) >= (rk[rec.grade] || 0)) rec.grade = res.grade; rec.date = todayStr(); if (first) { Game.count('clear'); if (/^Y2-A|^Y1-B/.test(stage.id)) Game.count('scale'); if (/^Y2-[BC]|^Y3-[AD]/.test(stage.id)) Game.count('chord'); if (stage.songId) { Game.count('song'); Game.S.stats.songs++; if (/클래식/.test((songById(stage.songId) || {}).genre || '')) Game.S.counters.classicSongs = (Game.S.counters.classicSongs || 0) + 1; } if (stage.final) Game.S.counters.finalExams = 5; } }
@@ -2642,11 +2684,11 @@ Views.play = (main, arg) => {
     if (m === 'demo') { $('#kbwrap').style.display = ''; return startDemo($('#hands').value); }
     if (m === 'scoreonly') { toast('악보만 보기 모드입니다. 연주 없이 악보를 살펴보세요.'); return; }
     if (m === 'record') return recordMode();
-    if (m === 'loop') { const a = clamp((+$('#l1').value || 1) - 1, 0, nM - 1), z = clamp(+$('#l2').value || nM, a + 1, nM); loopOn = true; const lp = () => { if (!loopOn) return; runRange(a * bpm, z * bpm, { mode: 'timed', kind: 'practice' }, res => { if (res.mode === 'timed') { recordStats(res, 'loop'); } if (loopOn) setTimeout(lp, 300); }); }; return lp(); }
+    if (m === 'loop') { const a = clamp((+$('#l1').value || 1) - 1, 0, nM - 1), z = clamp(+$('#l2').value || nM, a + 1, nM); loopOn = true; const lp = () => { if (!loopOn) return; runRange(a * bpm, z * bpm, { mode: JM(), kind: 'practice' }, res => { if (res.mode === 'timed' || res.mode === 'pace') { recordStats(res, 'loop'); } if (loopOn) setTimeout(lp, 300); }); }; return lp(); }
     if (m === 'mistakes') { const bm = lastRes && lastRes.badBeats && lastRes.badBeats.length ? [...new Set(lastRes.badBeats.map(b => Math.floor(b / bpm + 1e-6)))].sort((a, b) => a - b) : []; if (!bm.length) { toast('이전 연주에서 틀린 마디 기록이 없습니다. 먼저 한 번 연주해 보세요.'); return; } const rg = []; bm.forEach(x => { const l = rg[rg.length - 1]; if (l && x <= l[1] + 1) l[1] = x; else rg.push([x, x]); }); let ri = 0; loopOn = true; const lp = () => { if (!loopOn) return; const [a, z] = rg[ri % rg.length]; ri++; runRange(Math.max(0, a) * bpm, Math.min(nM, z + 1) * bpm, { mode: 'timed', kind: 'practice' }, res => { if (loopOn) setTimeout(lp, 300); }); }; return lp(); }
     if (m === 'rhythm') return runRange(0, total, { mode: 'timed', ignorePitch: true, kind: 'practice', hands: $('#hands').value }, res => { recordStats(res, 'rhythm'); resultModal(res, 'practice', {}); });
     if (m === 'memo') { Pl.hidden = true; $('.sheet', $('#pl')).style.visibility = 'hidden'; toast('악보가 가려집니다. 외워서 연주하세요!'); }
-    const o = { mode: 'timed', kind: 'practice', hands: m === 'rh' ? 'rh' : m === 'lh' ? 'lh' : $('#hands').value };
+    const o = { mode: (m === 'metro' || m === 'perform') ? 'timed' : JM(), kind: 'practice', hands: m === 'rh' ? 'rh' : m === 'lh' ? 'lh' : $('#hands').value };
     if (m === 'slow') o.scale = Math.min(scale, 0.5); if (m === 'metro') { o.metronome = true; } if (m === 'perform') { o.metronome = false; o.countIn = 0; o.scale = 1; }
     runRange(0, total, o, res => { recordStats(res, m); if (m === 'perform') { res.xp = Game.addXP(XPB[diff] * 0.3 * (res.acc / 100), '실전 공연'); } resultModal(res, 'practice', {}); });
   }
@@ -2655,6 +2697,8 @@ Views.play = (main, arg) => {
     $('#st').textContent = '녹음 중… (정지를 누르면 분석)'; $('#bStart').textContent = '● 녹음 중';
     ctl.stopRec = () => { const notes = Recorder.stop(); running = false; $('#bStart').textContent = '▶ 시작'; const a = analyzeRecording(notes); modal(`<h2>녹음 분석</h2><div id="an"></div><div class="sp1"></div><button id="x">닫기</button>`, (b, close) => { showAnalysis(a, notes, $('#an', b)); $('#x', b).onclick = close; }); };
   }
+  $('#bSkipN').onclick = () => { Pl.runner && Pl.runner.skipStep && Pl.runner.skipStep(); };
+  const skipVis = () => { const r = Pl.runner; $('#bSkipN') && ($('#bSkipN').hidden = !(r && r.running && (r.o.mode === 'pace' || r.o.mode === 'wait'))); }; const skipT = setInterval(skipVis, 300); onLeave(() => clearInterval(skipT));
   $('#bStart').onclick = () => { $('#bStart').textContent = '▶ 시작'; startMode(); };
   $('#bStop').onclick = () => { if (Recorder.on && ctl.stopRec) { const f = ctl.stopRec; ctl.stopRec = null; f(); } loopOn = false; Pl.stop(); running = false; $('#st').textContent = '정지'; Pl.hidden = false; $('.sheet', $('#pl')).style.visibility = 'visible'; };
   if (stage) { $('#bDemo').onclick = () => { $('#mode').value = 'demo'; $('#hands').value = 'both'; startDemo('both'); }; $('#bWait').onclick = startWait; $('#bCP').onclick = () => startCP(Math.min(rec.cp, secs.length - 1)); $('#bFinal').onclick = startFinal; }
