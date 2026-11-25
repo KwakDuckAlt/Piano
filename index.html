@@ -27,7 +27,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}input[type=checkbox]{acc
 .chip.on{border-color:var(--good);color:var(--good)}.chip.off{color:var(--mute)}
 #nav{background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:10px 8px}
 #nav a{display:flex;gap:10px;align-items:center;padding:9px 12px;border-radius:10px;color:var(--text);text-decoration:none;cursor:pointer;margin-bottom:2px}
-#nav a:hover{background:var(--panel2)}#nav a.act{background:var(--accent);color:#161616;font-weight:700}details.more>summary{cursor:pointer;color:var(--mute);padding:8px 0}
+#nav a:hover{background:var(--panel2)}#nav a.act{background:var(--accent);color:#161616;font-weight:700}[hidden]{display:none!important}#ti,#co{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 10px}.seg{display:flex;gap:4px;background:var(--panel2);padding:4px;border-radius:12px;margin:12px 0 10px;overflow-x:auto}.seg button{flex:1;white-space:nowrap;border:0;background:transparent;border-radius:9px;padding:8px 14px}.seg button.act{background:var(--accent);color:#161616;font-weight:700}.pane{padding:4px 2px}h3.mh{margin:22px 2px 8px;font-size:.95em;color:var(--mute);font-weight:600;letter-spacing:.04em}.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px}.tile{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text);text-decoration:none}.tile:hover{border-color:var(--accent);background:var(--panel2)}.tile .ti{font-size:1.6em;line-height:1.2}.hero{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}details.more>summary{cursor:pointer;color:var(--mute);padding:8px 0}
 #main{overflow:auto;padding:18px;scroll-behavior:smooth}
 .wrap{max-width:1500px;margin:0 auto}
 h1{font-size:1.5em;margin:0 0 4px}h2{font-size:1.15em;margin:0 0 10px}h3{font-size:1em;margin:0 0 6px}
@@ -1191,8 +1191,52 @@ const IO = (() => {
     const rh = normalizeStaff(mk('rh', 'treble', n => n.midi >= split)), lh = normalizeStaff(mk('lh', 'bass', n => n.midi < split));
     [rh, lh].forEach(s => s.events.forEach(e => { e.d = Math.max(grid, e.d); }));
     S.staves = [rh, lh].filter(s => s.events.length); if (!S.staves.length) S.staves = [rh];
+    if (o.respell !== false) { try { respell(S); } catch (e) { console.warn('표기 정리 실패', e); } }
     S.lowConf = S.staves.flatMap((s, si) => s.events.map((e, ei) => e.lowconf ? si + ':' + ei : null)).filter(Boolean);
     return S;
+  }
+
+  /* ── 조성 추정 + 화성학적 임시표(♯/♭) 표기 ── */
+  const SF_MAJ = ['Cb', 'Gb', 'Db', 'Ab', 'Eb', 'Bb', 'F', 'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#'], SF_MIN = ['Ab', 'Eb', 'Bb', 'F', 'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'G#', 'D#', 'A#'];
+  function estimateKey(S) {
+    const h = new Array(12).fill(0); S.staves.forEach(st => st.events.forEach(e => e.p.forEach(p => { h[((p % 12) + 12) % 12] += Math.max(0.25, e.d); })));
+    const MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88], MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+    const corr = (a, b) => { const ma = a.reduce((x, y) => x + y, 0) / 12, mb = b.reduce((x, y) => x + y, 0) / 12; let n = 0, da = 0, db = 0; for (let i = 0; i < 12; i++) { n += (a[i] - ma) * (b[i] - mb); da += (a[i] - ma) ** 2; db += (b[i] - mb) ** 2; } return da && db ? n / Math.sqrt(da * db) : 0; };
+    let best = null;
+    for (let t = 0; t < 12; t++) for (const minor of [false, true]) {
+      const prof = (minor ? MIN : MAJ), rot = h.map((_, i) => h[(i + t) % 12]), r = corr(rot, prof); // t를 으뜸음으로 회전
+      if (!best || r > best.r) best = { t, minor, r };
+    }
+    const majPc = best.minor ? (best.t + 3) % 12 : best.t; let sf = null;
+    for (let k = -7; k <= 7; k++) if ((((7 * k) % 12) + 12) % 12 === majPc && (sf === null || Math.abs(k) < Math.abs(sf) || (Math.abs(k) === Math.abs(sf) && k < 0))) sf = k;
+    return { sf, minor: best.minor, tonic: (best.minor ? SF_MIN : SF_MAJ)[sf + 7], r: best.r };
+  }
+  const ACC_STR = { '-2': 'bb', '-1': 'b', '0': '', '1': '#', '2': '##' };
+  function respell(S, o = {}) {
+    const K = o.key || estimateKey(S), sf = K.sf, tn = parseNote(K.tonic + '4'), KA = keyAcc(sf), STEP = [0, 1, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6];
+    const mk = (m, letter) => { let acc = (((m - LPC[letter]) % 12) + 12) % 12; if (acc > 6) acc -= 12; return acc; };
+    const nameOf = (m, letter, acc) => LET[letter] + ACC_STR[acc] + ((m - LPC[letter] - acc) / 12 - 1);
+    const tbl = m => { const rel = (((m - tn.m) % 12) + 12) % 12, L = (tn.letter + STEP[rel]) % 7; return { letter: L, acc: mk(m, L) }; };
+    S.sf = sf; S.mode = K.minor ? 'minor' : 'major'; if (KEYS[K.tonic + (K.minor ? 'm' : '')] !== undefined) S.key = K.tonic + (K.minor ? 'm' : '');
+    S.staves.forEach(st => {
+      const evs = st.events.filter(e => e.p.length), near = (arr, m) => { let b = null; for (const x of arr) if (Math.abs(x - m) <= 2 && (b === null || Math.abs(x - m) < Math.abs(b - m))) b = x; return b; };
+      evs.forEach((e, i) => {
+        const prevP = i > 0 ? evs[i - 1].p : [], nextP = i + 1 < evs.length ? evs[i + 1].p : [];
+        e.s = e.p.map(m => {
+          let sp = tbl(m); const diat = KA[sp.letter] === sp.acc;
+          if (!diat) { // 조성 밖 음: 진행 방향에 따라 선택 (상행 반음 → 샵, 하행 반음 → 플랫)
+            const nx = near(nextP, m), pv = near(prevP, m);
+            if (nx === m + 1) { const nl = tbl(nx).letter, L = (nl + 6) % 7, a = mk(m, L); if (Math.abs(a) <= 1) sp = { letter: L, acc: a }; }
+            else if (nx === m - 1) { const nl = tbl(nx).letter, L = (nl + 1) % 7, a = mk(m, L); if (Math.abs(a) <= 1) sp = { letter: L, acc: a }; }
+            else if (pv === m - 1) { const pl = tbl(pv); const a = mk(m, pl.letter); if (a === pl.acc + 1 && Math.abs(a) <= 1) sp = { letter: pl.letter, acc: a }; }
+            else if (pv === m + 1) { const pl = tbl(pv); const a = mk(m, pl.letter); if (a === pl.acc - 1 && Math.abs(a) <= 1) sp = { letter: pl.letter, acc: a }; }
+          }
+          const nm = nameOf(m, sp.letter, sp.acc); return nm === spell(m, sf).name ? null : nm;
+        });
+        if (e.s.every(x => !x)) delete e.s;
+      });
+    });
+    return K;
   }
   /* ── 파일 다운로드 / PDF(인쇄) ── */
   function download(name, data, mime) { const b = new Blob([data], { type: mime || 'application/octet-stream' }), a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
@@ -1201,7 +1245,7 @@ const IO = (() => {
     const w = window.open('', '_blank'); if (!w) throw new Error('팝업이 차단되었습니다. 팝업을 허용한 뒤 다시 시도하세요.');
     w.document.write(`<!doctype html><meta charset="utf-8"><title>${esc(S.title)}</title><style>:root{--ink:#000;--paper:#fff}body{margin:20px;font-family:Georgia,serif}h1{text-align:center;margin:0}.c{text-align:center;margin:0 0 12px;color:#444}svg{width:100%;height:auto;page-break-inside:avoid}@page{size:A4;margin:12mm}</style><h1>${esc(S.title)}</h1><p class="c">${esc(S.composer)}</p>${r.svg}<script>setTimeout(()=>print(),400)<\/script>`); w.document.close();
   }
-  return { validateScore, toJSON, toPianovaJS, fromJS, toMIDI, parseMIDI, toMusicXML, parseMusicXML, notesToScore, download, printPDF };
+  return { validateScore, toJSON, toPianovaJS, fromJS, toMIDI, parseMIDI, toMusicXML, parseMusicXML, notesToScore, estimateKey, respell, download, printPDF };
 })();
 
 /* ═══ engine.js ═══ */
@@ -2169,25 +2213,33 @@ Views.home = main => {
   const review = Object.entries(S.stage).filter(([k, v]) => v.cleared && v.best < 90 && stageById[k]).sort((a, b) => a[1].best - b[1].best).slice(0, 4).map(x => stageById[x[0]]);
   const recent = [...new Map(S.history.filter(h => stageById[h.id]).map(h => [h.id, h])).values()].slice(0, 4);
   const goalMin = S_('dailyGoal');
-  main.innerHTML = `<div class="wrap"><div class="row" style="justify-content:space-between"><div><h1>안녕하세요, ${esc(S.profile.name)}님 ${S.profile.avatar && !S.profile.img ? S.profile.avatar : ''}</h1><div class="mute">${S.title ? '칭호: ' + esc(S.title) + ' · ' : ''}리그: ${LEAGUES[S.league.tier]} · 저장소: ${Store.mode()}</div></div>
-  <div class="row"><button class="pri" id="cont">▶ 이어서 학습</button></div></div><div class="sp1"></div>
-  ${S_('streakNote') && S.streak.last !== todayStr() ? `<div class="card" style="border-color:var(--warn)">🔥 오늘 아직 연습하지 않았습니다. ${S.streak.count ? S.streak.count + '일 연속 기록을 이어가세요!' : '오늘 첫 연습을 시작해 보세요.'}</div><div class="sp1"></div>` : ''}
-  <div class="grid g3" style="margin-bottom:14px"><div class="card"><h3>🎓 아카데미</h3><p class="mute">단계별 5년 과정</p><button id="qa1">열기</button></div><div class="card"><h3>🎵 곡 연습</h3><p class="mute">좋아하는 곡 골라 연주</p><button id="qa2">열기</button></div><div class="card"><h3>🎹 자유 연주</h3><p class="mute">자유롭게 치고 녹음</p><button id="qa3">열기</button></div></div>
-  <details class="more"><summary>내 학습 현황 더 보기</summary><div class="sp1"></div>
+  const MENU = [['배우기', [['academy', '🎓', '메인 아카데미', '5년 단계별 교육과정'], ['special', '⭐', '특수 교육 과정', 'A~H 집중 코스'], ['ear', '👂', '청음 훈련', '귀로 음 맞히기'], ['theory', '📚', '음악 이론', '스케일·화음·조성'], ['diag', '🧭', '실력 진단', '내 수준 확인']]],
+    ['연주하기', [['library', '🎵', '곡 연습', allSongs().length + '곡 라이브러리'], ['free', '🎹', '자유 연주', '마이크·MIDI 인식과 녹음']]],
+    ['만들기', [['composer', '✍️', '작곡 스튜디오', '악보 작성 · 녹음 채보 · 공유']]],
+    ['내 공간', [['ach', '🏆', '업적', '도전 과제'], ['profile', '👤', '프로필', '이름·목표·아바타'], ['settings', '⚙️', '설정', '소리·마이크·화면'], ['account', '☁️', '계정', '저장·백업']]]];
+  main.innerHTML = `<div class="wrap">
+  <div class="card hero"><div style="min-width:0"><div class="mute">안녕하세요, ${esc(S.profile.name)}님 ${S.profile.avatar && !S.profile.img ? S.profile.avatar : ''} · Lv.${L.lv} · 🔥 ${S.streak.count}일 · 오늘 ${Math.round(d.min)}/${goalMin}분</div><h2 style="margin:6px 0 2px">${esc(cs.title)}</h2><div class="mute">${esc(cs.module)} · ${esc(cs.chapter)}</div></div><button class="pri" id="cont" style="white-space:nowrap">▶ 이어서 학습</button></div>
+  ${S_('streakNote') && S.streak.last !== todayStr() ? `<div class="mute" style="margin:8px 2px">🔥 오늘 아직 연습하지 않았어요. ${S.streak.count ? S.streak.count + '일 연속 기록을 이어가세요!' : '오늘 첫 연습을 시작해 보세요.'}</div>` : ''}
+  ${S.diag ? '' : `<div class="mute" style="margin:8px 2px">🧭 처음이라면 <a href="#diag">실력 진단</a>을 먼저 받아 보세요. 수준에 맞는 연차에서 시작할 수 있어요.</div>`}
+  <div class="seg" id="htabs" role="tablist"><button data-t="menu" class="act">메인 메뉴</button><button data-t="today">오늘의 학습</button><button data-t="rec">내 기록</button></div>
+  <div class="pane" data-p="menu">${MENU.map(([h, it]) => `<h3 class="mh">${h}</h3><div class="tiles">${it.map(([k, i, t, ds]) => `<a class="tile" href="#${k}"><span class="ti">${i}</span><b>${t}</b><span class="mute">${ds}</span></a>`).join('')}</div>`).join('')}</div>
+  <div class="pane" data-p="today" hidden>
+  <div class="grid g2"><div class="card"><h2>현재 스테이지</h2>${stageRow(cs)}<div class="sp1"></div><div class="mute">다음 체크포인트: 이 스테이지의 ${cs.kind === 'quiz' ? '퀴즈 통과' : '마디 단위 체크포인트 → 최종 시험'}</div></div>
+  <div class="card"><h2>오늘의 퀘스트</h2>${dq.map(q => { const c = d.c[q.k] || 0, ok2 = c >= q.n; return `<div class="row" style="justify-content:space-between;margin-bottom:6px"><span class="${ok2 ? 'ok' : ''}">${ok2 ? '✔' : '○'} ${q.ko}</span><span class="mute">${Math.min(c, q.n)} / ${q.n} · +${q.xp}XP</span></div>`; }).join('')}</div></div><div class="sp1"></div>
+<div class="grid g2">  <div class="card"><h2>약점 분석</h2>${weak.length ? weak.map(w => `<div class="row" style="justify-content:space-between;margin-bottom:6px"><span>${esc(w.m)} <span class="mute">평균 ${Math.round(w.v)}%</span></span><button class="sm weakgo" data-m="${esc(w.m)}" data-h="${w.hand || ''}">보충 연습</button></div>`).join('') : '<div class="mute">충분한 연주 기록이 쌓이면 약한 영역을 분석해 보충 코스를 추천합니다.</div>'}</div>
+  <div class="card"><h2>추천 복습</h2>${review.length ? review.map(stageRow).join('<div class="sp1"></div>') : '<div class="mute">통과했지만 정확도가 90% 미만인 스테이지가 여기에 표시됩니다.</div>'}</div></div><div class="sp1"></div>
+  </div>
+  <div class="pane" data-p="rec" hidden>
   <div class="grid g4"><div class="card"><div class="mute">플레이어 레벨</div><div class="big hl">Lv.${L.lv}</div><div class="bar"><i style="width:${L.pct * 100}%"></i></div><div class="mute">${S.xp} / ${L.next} XP</div></div>
   <div class="card"><div class="mute">현재 학습 연차</div><div class="big">${year}년차</div><div class="mute">${YEARS[year]}</div></div>
   <div class="card"><div class="mute">전체 교육과정 진행률</div><div class="big">${Math.round(done / total * 100)}%</div><div class="bar"><i style="width:${done / total * 100}%"></i></div><div class="mute">${done} / ${total} 스테이지</div></div>
   <div class="card"><div class="mute">연속 학습 · 오늘 연습</div><div class="big">🔥 ${S.streak.count}일</div><div class="bar"><i style="width:${clamp(d.min / goalMin * 100, 0, 100)}%"></i></div><div class="mute">${Math.round(d.min)} / ${goalMin}분 (최고 ${S.streak.best}일)</div></div></div><div class="sp1"></div>
-  <div class="grid g2"><div class="card"><h2>현재 스테이지</h2>${stageRow(cs)}<div class="sp1"></div><div class="mute">다음 체크포인트: 이 스테이지의 ${cs.kind === 'quiz' ? '퀴즈 통과' : '마디 단위 체크포인트 → 최종 시험'}</div></div>
-  <div class="card"><h2>오늘의 퀘스트</h2>${dq.map(q => { const c = d.c[q.k] || 0, ok2 = c >= q.n; return `<div class="row" style="justify-content:space-between;margin-bottom:6px"><span class="${ok2 ? 'ok' : ''}">${ok2 ? '✔' : '○'} ${q.ko}</span><span class="mute">${Math.min(c, q.n)} / ${q.n} · +${q.xp}XP</span></div>`; }).join('')}</div></div><div class="sp1"></div>
-  <div class="grid g3"><div class="card"><h2>주간 학습 시간</h2><div class="row" style="align-items:flex-end;height:90px;gap:8px">${days.map(x => `<div style="flex:1;text-align:center"><div style="height:${Math.max(3, x.m / mx * 70)}px;background:var(--accent);border-radius:4px"></div><div class="mute">${x.l}</div><div style="font-size:.7em">${x.m}분</div></div>`).join('')}</div></div>
-  <div class="card"><h2>약점 분석</h2>${weak.length ? weak.map(w => `<div class="row" style="justify-content:space-between;margin-bottom:6px"><span>${esc(w.m)} <span class="mute">평균 ${Math.round(w.v)}%</span></span><button class="sm weakgo" data-m="${esc(w.m)}" data-h="${w.hand || ''}">보충 연습</button></div>`).join('') : '<div class="mute">충분한 연주 기록이 쌓이면 약한 영역을 분석해 보충 코스를 추천합니다.</div>'}</div>
-  <div class="card"><h2>추천 복습</h2>${review.length ? review.map(stageRow).join('<div class="sp1"></div>') : '<div class="mute">통과했지만 정확도가 90% 미만인 스테이지가 여기에 표시됩니다.</div>'}</div></div><div class="sp1"></div>
+  <div class="grid g2"><div class="card"><h2>주간 학습 시간</h2><div class="row" style="align-items:flex-end;height:90px;gap:8px">${days.map(x => `<div style="flex:1;text-align:center"><div style="height:${Math.max(3, x.m / mx * 70)}px;background:var(--accent);border-radius:4px"></div><div class="mute">${x.l}</div><div style="font-size:.7em">${x.m}분</div></div>`).join('')}</div></div></div><div class="sp1"></div>
   <div class="grid g2"><div class="card"><h2>최근 연습한 곡 / 스테이지</h2>${recent.length ? recent.map(h => stageRow(stageById[h.id])).join('<div class="sp1"></div>') : '<div class="mute">아직 연습 기록이 없습니다.</div>'}</div>
   <div class="card"><h2>주간·월간 도전</h2>${wk.map(q => `<div class="row" style="justify-content:space-between"><span>${q.cur >= q.n ? '✔' : '○'} ${q.ko}</span><span class="mute">${Math.min(q.cur, q.n)}/${q.n}</span></div><div class="bar"><i style="width:${clamp(q.cur / q.n * 100, 0, 100)}%"></i></div><div class="sp1"></div>`).join('')}<div class="row" style="justify-content:space-between"><span>${mo.ko}</span><span class="mute">${mo.cur}/${mo.n}</span></div><div class="bar"><i style="width:${clamp(mo.cur / mo.n * 100, 0, 100)}%"></i></div></div></div>
-  </details>
-  ${S.diag ? '' : '<div class="sp1"></div><div class="card" style="border-color:var(--accent)"><h2>🧭 실력 진단을 먼저 받아 보세요</h2><p class="mute">이미 피아노를 배운 적이 있다면 진단 결과에 따라 초급 과정을 건너뛰고 적절한 연차에서 시작할 수 있습니다.</p><button class="pri" onclick="go(\'diag\')">실력 진단 시작</button></div>'}</div>`;
-  $('#cont').onclick = () => go('play', 'stage/' + cs.id); bindStageRows(main); $('#qa1').onclick = () => go('academy'); $('#qa2').onclick = () => go('library'); $('#qa3').onclick = () => go('free');
+  </div></div>`;
+  $$('#htabs button', main).forEach(b => b.onclick = () => { $$('#htabs button', main).forEach(x => x.classList.toggle('act', x === b)); $$('.pane', main).forEach(p => p.hidden = p.dataset.p !== b.dataset.t); });
+  $('#cont').onclick = () => go('play', 'stage/' + cs.id); bindStageRows(main);
   $$('.weakgo', main).forEach(b => b.onclick = () => { const m = b.dataset.m, h = b.dataset.h; const st = STAGES.find(s => (h ? s.hands === h && s.kind !== 'quiz' : s.module === m) && !(Game.S.stage[s.id] && Game.S.stage[s.id].cleared)) || STAGES.find(s => s.module === m); st ? go('play', 'stage/' + st.id) : go('academy'); });
 };
 
@@ -2522,15 +2574,12 @@ Views.play = (main, arg) => {
     stopAll() { Pl.stop(); running = false; loopOn = false; }
   }; let loopOn = false;
   const modeOpts = MODES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
-  $('#ctl').innerHTML = `${stage ? `<button id="bDemo">▶ 시범</button><button id="bWait">⏸ 대기 연습</button><button id="bCP" class="pri">🚩 체크포인트 도전</button><button id="bFinal" class="good">🏁 최종 시험</button><span style="flex:1"></span>` : ''}
-  <label class="row">모드 <select id="mode" style="width:auto">${modeOpts}</select></label>
-  <label class="row">손 <select id="hands" style="width:auto"><option value="both">양손</option><option value="rh">오른손</option><option value="lh">왼손</option></select></label>
-  <label class="row">템포 <input type="range" id="tp" min="25" max="200" step="5" value="${Math.round(scale * 100)}" style="width:110px"> <b id="tpv">${Math.round(scale * 100)}%</b></label>
-  <label class="row"><input type="checkbox" id="metro" ${S_('metro') ? 'checked' : ''}> 메트로놈</label>
-  <span id="loopbox" style="display:none" class="row">마디 <input type="number" id="l1" min="1" max="${nM}" value="1" style="width:64px"> – <input type="number" id="l2" min="1" max="${nM}" value="${Math.min(nM, 4)}" style="width:64px"></span>
-  <button id="bStart" class="pri">▶ 시작</button><button id="bStop">■ 정지</button><button id="bFull" class="sm ghost">건반 88키</button>${type === 'song' || type === 'comp' ? `<button class="sm ghost" id="bFav">${Game.S.fav.includes(id) ? '★' : '☆'}</button>` : ''}`;
+  $('#ctl').innerHTML = `${stage ? `<div class="row" style="width:100%;gap:8px"><span class="mute" style="font-size:.85em">연습 방법</span><button id="bDemo">▶ 시범</button><button id="bWait">⏸ 대기 연습</button><button id="bCP" class="pri">🚩 체크포인트 도전</button><button id="bFinal" class="good">🏁 최종 시험</button></div>` : ''}
+  <div class="row" style="width:100%;gap:8px"><label class="row">모드 <select id="mode" style="width:auto">${modeOpts}</select></label><button id="bStart" class="pri">▶ 시작</button><button id="bStop">■ 정지</button>${type === 'song' || type === 'comp' ? `<button class="sm ghost" id="bFav">${Game.S.fav.includes(id) ? '★' : '☆'}</button>` : ''}<span style="flex:1"></span><button class="sm ghost" id="bOpt">⚙ 연습 옵션</button></div>
+  <div id="opts" hidden class="row" style="width:100%;gap:14px;padding-top:10px;border-top:1px solid var(--line)"><label class="row">손 <select id="hands" style="width:auto"><option value="both">양손</option><option value="rh">오른손</option><option value="lh">왼손</option></select></label><label class="row">템포 <input type="range" id="tp" min="25" max="200" step="5" value="${Math.round(scale * 100)}" style="width:110px"> <b id="tpv">${Math.round(scale * 100)}%</b></label><label class="row"><input type="checkbox" id="metro" ${S_('metro') ? 'checked' : ''}> 메트로놈</label><span id="loopbox" style="display:none" class="row">마디 <input type="number" id="l1" min="1" max="${nM}" value="1" style="width:64px"> – <input type="number" id="l2" min="1" max="${nM}" value="${Math.min(nM, 4)}" style="width:64px"></span><button class="sm ghost" id="bFull">건반 88키</button></div>`;
+  $('#bOpt').onclick = () => { const o = $('#opts'); o.hidden = !o.hidden; $('#bOpt').classList.toggle('pri', !o.hidden); };
   $('#tp').oninput = e => { scale = +e.target.value / 100; $('#tpv').textContent = e.target.value + '%'; };
-  $('#mode').onchange = () => { const m = $('#mode').value; $('#loopbox').style.display = m === 'loop' ? 'flex' : 'none'; if (m === 'slow') { scale = .5; $('#tp').value = 50; $('#tpv').textContent = '50%'; } $('#pl .kbhost') && ($('#kbwrap').style.display = m === 'scoreonly' || m === 'listen' ? 'none' : ''); };
+  $('#mode').onchange = () => { const m = $('#mode').value; $('#loopbox').style.display = m === 'loop' ? 'flex' : 'none'; if (m === 'loop') { $('#opts').hidden = false; $('#bOpt').classList.add('pri'); } if (m === 'slow') { scale = .5; $('#tp').value = 50; $('#tpv').textContent = '50%'; } $('#pl .kbhost') && ($('#kbwrap').style.display = m === 'scoreonly' || m === 'listen' ? 'none' : ''); };
   $('#bFull').onclick = () => { const full = Pl.kb.range[0] === 21; setS('kbFull', !full); const r = !full ? [21, 108] : kbRangeFor(S); Pl.kb.setRange(r[0], r[1]); };
   const fv = $('#bFav'); if (fv) fv.onclick = () => { const f = Game.S.fav, i = f.indexOf(id); i >= 0 ? f.splice(i, 1) : f.push(id); Game.save(); fv.textContent = i >= 0 ? '☆' : '★'; };
   const base = () => ({ scale, metronome: $('#metro').checked, countIn: S_('countIn') ? bpm : 0 });
@@ -2647,7 +2696,7 @@ async function importFile(f) {
 /* ───── 자유 연주 ───── */
 Views.free = main => {
   let live = [], recSt = false;
-  main.innerHTML = `<div class="wrap"><h1>자유 연주</h1><div class="mute">실제 피아노 소리(마이크), USB MIDI, 가상 건반으로 연주하면 음·옥타브·주파수·음량·신뢰도를 실시간으로 표시합니다. 표시되는 값은 모두 실제 입력에서 계산된 것입니다.</div><div class="sp1"></div>
+  main.innerHTML = `<div class="wrap"><h1>자유 연주</h1><div class="mute">마이크·MIDI·가상 건반으로 연주하면 인식된 음을 실시간으로 보여 줍니다.</div><div class="sp1"></div>
   <div class="grid g2"><div class="card"><div class="row" style="justify-content:space-between"><h2>실시간 인식</h2><div class="row"><button id="fm" class="sm">🎤 마이크</button><button id="fmi" class="sm">🎹 MIDI</button><button class="sm" id="fcal">⏱ 지연 보정</button></div></div>
   <div class="big" id="chord" style="min-height:1.3em">—</div><div class="mute" id="cdet">연주하면 화음 이름이 표시됩니다</div><div class="sp1"></div><table id="nt"><tr><th>음</th><th>계이름</th><th>MIDI</th><th>주파수</th><th>센트</th><th>음량</th><th>신뢰도</th><th>길이</th></tr></table><div class="sp1"></div><div class="row"><span class="chip" id="ped">페달: -</span><span class="chip" id="srcc">입력: -</span><span class="chip" id="yinc">YIN: -</span></div><div class="mute" style="margin-top:6px">마이크는 환경·배음 영향으로 다성 인식에 한계가 있어 불확실한 음은 낮은 신뢰도로 표시됩니다. 오래 이어지는 음(2.5초↑)은 서스테인(페달 가능성)으로 표시합니다.</div></div>
   <div class="card"><h2>실시간 오선보</h2><div id="lv" class="sheet" style="min-height:230px"></div><div class="row" style="margin-top:10px"><button id="rc" class="pri">● 녹음 시작</button><button id="clr" class="sm">지우기</button></div><div id="an" style="margin-top:8px"></div></div></div><div class="sp1"></div><div class="card"><div id="kbwrap"><div id="fk"></div></div></div></div>`;
@@ -2984,18 +3033,19 @@ Composer.edit = (main, id, task) => {
   const draw = () => { reflow(S); const sheet = $('#cs'); info = renderScore(S, { width: Math.max(360, sheet.clientWidth - 6), scale: S_('scoreScale'), showTempo: true, noteNames: S_('solfege'), fingering: false, chords: true, state: () => '' }); sheet.innerHTML = info.svg; sel.forEach(k => { const n = $('[data-k="' + k + '"]', sheet); n && n.classList.add('sel'); }); $('#nb').textContent = Math.ceil(scoreBeats(S) / beatsPerBar(S)) + '마디'; save(); if (task) $('#chk').innerHTML = ''; };
   const mut = f => { snap(); f(); sel.clear(); draw(); };
   main.innerHTML = `<div class="wrap"><div class="row" style="justify-content:space-between"><div class="row"><button id="bk" class="sm">← 목록</button><input id="ti" value="${esc(S.title)}" style="min-width:200px;font-size:1.1em"><input id="co" value="${esc(S.composer || '')}" placeholder="작곡가" style="width:130px"></div><div class="row"><button class="sm" id="un">↶</button><button class="sm" id="re">↷</button></div></div>${task ? `<div class="card" style="margin:8px 0"><b>과제:</b> ${esc(task.title)} — ${esc(task.goal)}<div id="chk"></div><button class="pri sm" id="sub">검증 및 제출</button></div>` : ''}
-  <div class="card" style="margin:8px 0"><div class="row"><label>조 <select id="ky" style="width:auto">${Object.keys(KEYS).map(k => `<option ${k === S.key ? 'selected' : ''}>${k}</option>`).join('')}</select></label><label>박자 <select id="ts" style="width:auto">${['4/4', '3/4', '2/4', '6/8', '2/2', '5/4'].map(t => `<option ${t === S.tsig.join('/') ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>템포 <input id="tm" type="number" min="30" max="240" value="${S.tempo}" style="width:70px"></label><span class="chip" id="nb"></span><button class="sm" id="ab">+마디</button><button class="sm" id="rb">−마디</button><button class="sm" id="tu">전체 ↑½</button><button class="sm" id="td">전체 ↓½</button></div>
-  <div class="row" style="margin-top:8px"><b>음표</b>${DUR.map(([s, d, n]) => `<button class="sm dbtn" data-d="${d}" title="${n}">${s} ${n}</button>`).join('')}<label class="row"><input type="checkbox" id="dt"> 점</label><label class="row"><input type="checkbox" id="rs"> 쉼표</label><label class="row">성부 <select id="vc" style="width:auto"><option value="1">1 (위)</option><option value="2">2 (아래)</option><option value="3">3</option></select></label><label class="row">잇단 <select id="tu" style="width:auto"><option value="">없음</option><option value="3,2">3잇단 (셋잇단)</option><option value="5,4">5잇단</option><option value="6,4">6잇단</option><option value="7,4">7잇단</option></select></label><label class="row">변화표 <select id="ac" style="width:auto"><option value="">조표 따름</option><option value="#">♯</option><option value="b">♭</option><option value="n">♮</option></select></label><span class="mute">악보를 클릭해 입력 · 음표 클릭으로 선택(Shift로 다중)</span></div>
-  <div class="row" style="margin-top:8px"><b>편집</b><button class="sm" id="del">삭제</button><button class="sm" id="up">↑½</button><button class="sm" id="dn">↓½</button><button class="sm" id="uo">↑옥타브</button><button class="sm" id="do">↓옥타브</button><button class="sm" id="sd">길이=현재음표</button><button class="sm" id="sv">성부=현재성부</button><button class="sm" id="ti2">붙임줄</button><button class="sm" id="dy">셈여림</button><button class="sm" id="cs2">코드기호</button><button class="sm" id="cp">복사</button><button class="sm" id="ps">붙여넣기</button><button class="sm" id="sa">전체선택</button></div>
-  <div class="row" style="margin-top:8px"><button class="pri" id="pl">▶ 재생</button><button id="st">■ 정지</button><label class="row"><input type="checkbox" id="si"> 건반/MIDI 스텝 입력</label><button id="rc">● 연주 녹음 → 자동 채보</button><span id="rst" class="mute"></span></div>
-  <div class="row" style="margin-top:8px"><button class="sm pri" id="xsh">📤 공유하기 (카톡·문자)</button><b>내보내기</b><button class="sm" id="xj">JSON</button><button class="sm" id="xs">PIANOVA JS</button><button class="sm" id="xm">MIDI</button><button class="sm" id="xx">MusicXML</button><button class="sm" id="xp">PDF(인쇄)</button><button class="sm" id="im">가져오기(현재 곡 대체)</button><input type="file" id="fi" hidden accept=".js,.json,.mid,.midi,.xml,.musicxml"></div></div>
+  <div class="card" style="margin:8px 0"><div class="row qbar" style="gap:8px"><button class="pri" id="pl">▶ 재생</button><button id="st">■ 정지</button><button id="rc">● 연주 녹음 → 자동 채보</button><button class="sm pri" id="xsh">📤 공유하기 (카톡·문자)</button><span id="rst" class="mute"></span></div>
+  <div class="seg" id="ctabs" role="tablist"><button data-t="in" class="act">음표 입력</button><button data-t="ed">편집</button><button data-t="song">곡 설정</button><button data-t="ex">내보내기</button></div>
+  <div class="pane" data-p="in"><div class="row" style="gap:8px"><b>음표</b>${DUR.map(([s, d, n]) => `<button class="sm dbtn" data-d="${d}" title="${n}">${s} ${n}</button>`).join('')}<label class="row"><input type="checkbox" id="dt"> 점</label><label class="row"><input type="checkbox" id="rs"> 쉼표</label><label class="row">성부 <select id="vc" style="width:auto"><option value="1">1 (위)</option><option value="2">2 (아래)</option><option value="3">3</option></select></label><label class="row">잇단 <select id="tp" style="width:auto"><option value="">없음</option><option value="3,2">3잇단 (셋잇단)</option><option value="5,4">5잇단</option><option value="6,4">6잇단</option><option value="7,4">7잇단</option></select></label><label class="row">변화표 <select id="ac" style="width:auto"><option value="">조표 따름</option><option value="#">♯</option><option value="b">♭</option><option value="n">♮</option></select></label><label class="row"><input type="checkbox" id="si"> 건반/MIDI 스텝 입력</label><span class="mute">악보를 클릭해 입력 · 음표 클릭으로 선택(Shift로 다중)</span></div></div>
+  <div class="pane" data-p="ed" hidden><div class="row" style="gap:8px"><b>편집</b><button class="sm" id="del">삭제</button><button class="sm" id="up">↑½</button><button class="sm" id="dn">↓½</button><button class="sm" id="uo">↑옥타브</button><button class="sm" id="do">↓옥타브</button><button class="sm" id="sd">길이=현재음표</button><button class="sm" id="sv">성부=현재성부</button><button class="sm" id="ti2">붙임줄</button><button class="sm" id="dy">셈여림</button><button class="sm" id="cs2">코드기호</button><button class="sm" id="cp">복사</button><button class="sm" id="ps">붙여넣기</button><button class="sm" id="sa">전체선택</button><button class="sm" id="rsp" title="조성을 자동 분석해 ♯/♭ 표기를 화성에 맞게 다시 정리합니다 (Cb·E♯ 같은 표기 포함)">♯♭ 표기 정리</button></div></div>
+  <div class="pane" data-p="song" hidden><div class="row" style="gap:8px"><label>조 <select id="ky" style="width:auto">${Object.keys(KEYS).map(k => `<option ${k === S.key ? 'selected' : ''}>${k}</option>`).join('')}</select></label><label>박자 <select id="ts" style="width:auto">${['4/4', '3/4', '2/4', '6/8', '2/2', '5/4'].map(t => `<option ${t === S.tsig.join('/') ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>템포 <input id="tm" type="number" min="30" max="240" value="${S.tempo}" style="width:70px"></label><span class="chip" id="nb"></span><button class="sm" id="ab">+마디</button><button class="sm" id="rb">−마디</button><button class="sm" id="tu">전체 ↑½</button><button class="sm" id="td">전체 ↓½</button></div></div>
+  <div class="pane" data-p="ex" hidden><div class="row" style="gap:8px"><b>내보내기</b><button class="sm" id="xj">JSON</button><button class="sm" id="xs">PIANOVA JS</button><button class="sm" id="xm">MIDI</button><button class="sm" id="xx">MusicXML</button><button class="sm" id="xp">PDF(인쇄)</button><button class="sm" id="im">가져오기(현재 곡 대체)</button><input type="file" id="fi" hidden accept=".js,.json,.mid,.midi,.xml,.musicxml"></div></div></div>
   <div class="card"><div class="sheet" id="cs" style="max-height:480px;cursor:crosshair"></div></div><div class="sp1"></div><div class="card"><div id="kbwrap"><div id="kbh"></div></div></div></div>`;
   const kb = Keyboard($('#kbh'), { lo: 36, hi: 96, minKeyPx: 20 });
   const ku = Input.on(e => { if (e.type === 'on') kb.mark(e.midi, 'on', true); else if (e.type === 'off') kb.mark(e.midi, 'on', false); if (e.type === 'on' && stepIn) stepInput(e.midi); });
   onLeave(() => { ku(); hndl && hndl.stop && hndl.stop(); Recorder.on && Recorder.stop(); clearInterval(play); });
   let vc = 1, tup = null; const curD = () => dur * (dot ? 1.5 : 1) * (tup ? tup[1] / tup[0] : 1);
   $$('.dbtn').forEach(b => b.onclick = () => { dur = +b.dataset.d; $$('.dbtn').forEach(x => x.classList.toggle('pri', x === b)); }); $$('.dbtn')[2].classList.add('pri');
-  $('#dt').onchange = e => dot = e.target.checked; $('#rs').onchange = e => rest = e.target.checked; $('#vc').onchange = e => vc = +e.target.value; $('#tu').onchange = e => { tup = e.target.value ? e.target.value.split(',').map(Number) : null; }; $('#ac').onchange = e => acc = e.target.value;
+  $('#dt').onchange = e => dot = e.target.checked; $('#rs').onchange = e => rest = e.target.checked; $('#vc').onchange = e => vc = +e.target.value; $('#tp').onchange = e => { tup = e.target.value ? e.target.value.split(',').map(Number) : null; }; $('#ac').onchange = e => acc = e.target.value;
   $('#ti').oninput = e => { S.title = e.target.value; save(); }; $('#co').oninput = e => { S.composer = e.target.value; save(); };
   $('#ky').onchange = e => mut(() => { S.key = e.target.value; S.sf = KEYS[S.key]; S.mode = /m$/.test(S.key) ? 'minor' : 'major'; });
   $('#ts').onchange = e => mut(() => { const [n, d] = e.target.value.split('/').map(Number); S.tsig = [n, d]; S.staves.forEach(s => s.events = s.events.filter(x => x.p.length)); });
@@ -3030,6 +3080,8 @@ Composer.edit = (main, id, task) => {
   $('#st').onclick = () => { hndl && hndl.stop && hndl.stop(); clearInterval(play); const c = $('#pv-cursor'); c && c.setAttribute('opacity', 0); };
   // 녹음 → 채보
   $('#rc').onclick = async () => { if (!Recorder.on) { await ensureInputForRecording(); Audio_.ensure(); const c = Audio_.ensure(), spb = 60 / S.tempo; for (let i = 0; i < 300; i++) Audio_.click(c.currentTime + .2 + i * spb, i % beatsPerBar(S) === 0, .5); Recorder.start(); $('#rc').textContent = '■ 녹음 종료'; $('#rst').textContent = '메트로놈에 맞춰 연주하세요 (마이크가 켜져 있으면 마이크 입력도 기록됩니다)'; return; } const n = Recorder.stop(); $('#rc').textContent = '● 연주 녹음 → 자동 채보'; $('#rst').textContent = ''; if (!n.length) return toast('기록된 음이 없습니다.'); try { const T = IO.notesToScore(n, { tempo: S.tempo, grid: .25, tsig: S.tsig }); if (!await yesno('녹음을 채보하여 현재 악보를 대체할까요? (↶로 되돌릴 수 있습니다)')) return; mut(() => { S.staves = T.staves; S.lowConf = T.lowConf; }); toast(T.lowConf && T.lowConf.length ? `채보 완료 — 확인이 필요한 음 ${T.lowConf.length}개가 있습니다(마이크 신뢰도 낮음).` : '채보 완료'); } catch (er) { toast(er.message); } };
+  $$('#ctabs button').forEach(b => b.onclick = () => { $$('#ctabs button').forEach(x => x.classList.toggle('act', x === b)); $$('.pane', main).forEach(p => p.hidden = p.dataset.p !== b.dataset.t); });
+  $('#rsp').onclick = () => { if (!S.staves.some(st => st.events.some(e => e.p.length))) return toast('음을 먼저 입력한 뒤 사용하세요.'); mut(() => { const K = IO.respell(S); toast('조성 ' + K.tonic + (K.minor ? ' 단조' : ' 장조') + ' 기준으로 ♯/♭ 표기를 정리했습니다.'); $('#ky').value = S.key || $('#ky').value; }); };
   // 내보내기
   const fn = ext => (S.title || 'pianova').replace(/[^\w가-힣 -]/g, '_') + ext, tryX = f => { try { f(); } catch (e) { toast(e.message); } };
   $('#xsh').onclick = () => openShare({ score: S, title: S.title });
