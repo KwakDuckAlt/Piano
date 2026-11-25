@@ -207,7 +207,9 @@ const DSP = (() => {
           }
           const sal = s / ws;
           // 기음 또는 2배음이 약하고 상위 배음만 있는 후보(하위 옥타브 오인식) 억제
-          if (cnt < 3 || (m >= 45 && h1 < 0.2) || (m < 45 && !hs[1])) continue;
+          // 하위 옥타브 유령 억제: 진짜 음 m은 홀수 배음(1·3·5)도 가지지만, 한 옥타브 위 음이 만드는 유령 m은 홀수 배음이 없음
+          let odd = 0; for (const hi of [0, 2, 4]) { const p = hs[hi]; if (p && (20 * Math.log10(p.a / amax) + o.dbRange) / o.dbRange > 0.12) odd++; }
+          if (cnt < 3 || (m >= 45 && h1 < 0.2) || (m < 45 && !hs[1]) || (o.oddMin && odd < o.oddMin)) continue;
           if (!best || sal > best.sal) best = { m, sal, hs, cnt };
         }
         if (!best) break;
@@ -247,7 +249,7 @@ const DSP = (() => {
       const H = this.hist;
       const avg = H.length ? H.reduce((a, b) => a + b, 0) / H.length : rms;
       this.floor = Math.min(this.floor * 1.0005 + 1e-7, Math.max(1e-5, rms)) * 0.999 + 1e-6;
-      let on = false;
+      let on = false; this.ratio = rms / (avg + 1e-6);
       if (rms > this.gate && rms > avg * this.k + 0.0008 && t - this.last > 0.07) { on = true; this.last = t; }
       H.push(rms); if (H.length > 8) H.shift();
       return on;
@@ -262,7 +264,7 @@ const DSP = (() => {
     }
     addOnset(t) { this.onsets.push(t); if (this.onsets.length > 16) this.onsets.shift(); }
     /** time: 프레임 끝 시각(초). windowSec: 분석 창 길이 */
-    update(notes, time, windowSec) {
+    update(notes, time, windowSec, restr, est) {
       const ev = [], o = this.o, seen = new Set();
       for (const n of notes) {
         seen.add(n.midi);
@@ -273,9 +275,14 @@ const DSP = (() => {
         const recentOnset = this.onsets.filter(t => t > time - windowSec - 0.05 && t <= time).pop();
         if (!s.active && s.cnt >= o.onFrames) {
           s.active = true; s.peak = n.amp;
-          s.start = recentOnset !== undefined ? recentOnset : time - windowSec * 0.5;
+          s.start = est && est.has(n.midi) ? est.get(n.midi) : recentOnset !== undefined ? recentOnset : time - windowSec * 0.5;
           ev.push({ type: 'on', midi: n.midi, time: s.start, amp: n.amp, conf: n.conf });
-        } else if (s.active && rising && recentOnset !== undefined && recentOnset > s.start + 0.08) {
+        } else if (s.active && restr && restr.has(n.midi) && time - s.start > (this.o.rsGap || 0.1)) {
+          const ts = time - 0.03;
+          ev.push({ type: 'off', midi: n.midi, time: ts - 0.001, dur: ts - s.start });
+          s.start = ts; s.peak = n.amp;
+          ev.push({ type: 'on', midi: n.midi, time: ts, amp: n.amp, conf: n.conf, retrig: true });
+        } else if (s.active && !restr && rising && recentOnset !== undefined && recentOnset > s.start + 0.08) {
           ev.push({ type: 'off', midi: n.midi, time: recentOnset, dur: recentOnset - s.start });
           s.start = recentOnset; s.peak = n.amp;
           ev.push({ type: 'on', midi: n.midi, time: recentOnset, amp: n.amp, conf: n.conf, retrig: true });
@@ -483,17 +490,42 @@ const Store = (() => {
 /* ───── 오디오 합성 ───── */
 const Audio_ = (() => {
   let ctx = null, master = null, comp = null, vol = 0.8;
+  const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+  let silentEl = null, unlocked = false, hinted = false;
   const ensure = () => {
     if (!ctx) {
       const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
-      ctx = new AC({ latencyHint: 'interactive' });
+      try { ctx = new AC({ latencyHint: 'interactive' }); } catch (e) { try { ctx = new AC(); } catch (e2) { return null; } }
       master = ctx.createGain(); master.gain.value = vol;
       comp = ctx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
       master.connect(comp); comp.connect(ctx.destination);
+      ctx.onstatechange = () => { if (ctx.state === 'running') unlocked = true; };
     }
-    if (ctx.state === 'suspended') ctx.resume();
+    if (ctx.state !== 'running') { try { const p = ctx.resume(); p && p.catch && p.catch(() => { }); } catch (e) { } }
     return ctx;
   };
+  /* 기기별 오디오 잠금 해제: iOS/Safari/모바일 Chrome은 '사용자 제스처' 안에서 resume + 무음 재생을 해야 소리가 납니다.
+     (pointerdown 한 번만으로는 iOS에서 해제되지 않으므로 touchend/click/keydown 등에서 계속 시도) */
+  function unlock() {
+    try {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { }
+      const c = ensure(); if (!c) return;
+      if (c.state !== 'running') { const b = c.createBuffer(1, 1, 22050), s = c.createBufferSource(); s.buffer = b; s.connect(c.destination); s.start(0); }
+      if (IOS && !silentEl) { // 무음(벨소리) 스위치가 켜져 있어도 소리가 나도록 미디어 오디오 세션으로 전환
+        silentEl = new Audio(); silentEl.setAttribute('playsinline', ''); silentEl.loop = true; silentEl.volume = 0.001;
+        silentEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAABErAAABAAgAZGF0YQAAAAA='; const pr = silentEl.play(); pr && pr.catch && pr.catch(() => { silentEl = null; });
+      }
+      if (c.state === 'running' && !hinted && IOS) { hinted = true; document.dispatchEvent(new CustomEvent('audio-hint', { detail: 'ios' })); }
+    } catch (e) { }
+  }
+  ['touchstart', 'touchend', 'pointerup', 'click', 'keydown'].forEach(ev => addEventListener(ev, () => { if (!ctx || ctx.state !== 'running') unlock(); }, { capture: true, passive: true }));
+  addEventListener('visibilitychange', () => { if (!document.hidden && ctx && ctx.state !== 'running') { try { ctx.resume().catch(() => { }); } catch (e) { } } });
+  addEventListener('pageshow', () => { if (ctx && ctx.state !== 'running') { try { ctx.resume().catch(() => { }); } catch (e) { } } });
+  /* 재생 시작 직전: 컨텍스트가 실제로 켜질 때까지 잠시 기다림 (최대 timeout ms). 켜지지 않으면 false */
+  function ready(timeout = 1200) {
+    const c = ensure(); if (!c) return Promise.resolve(false); if (c.state === 'running') return Promise.resolve(true);
+    return new Promise(res => { let done = false; const fin = v => { if (!done) { done = true; clearInterval(iv); res(v); } }, iv = setInterval(() => { if (c.state === 'running') fin(true); }, 50); setTimeout(() => { if (c.state !== 'running') document.dispatchEvent(new CustomEvent('audio-hint', { detail: 'blocked' })); fin(c.state === 'running'); }, timeout); try { c.resume().catch(() => { }); } catch (e) { } });
+  }
   const TIMBRES = {
     piano: { parts: [[1, 1, 3.2], [2, .55, 4.5], [3, .32, 6], [4, .18, 8], [5, .1, 10], [6, .06, 12]], atk: .004, type: 'sine', noise: .06 },
     strings: { parts: [[1, 1, .2], [2, .5, .3], [3, .3, .4]], atk: .08, type: 'sawtooth', lp: 2400, sus: true },
@@ -532,19 +564,30 @@ const Audio_ = (() => {
   }
   function tone(f, dur = 0.3, type = 'sine', v = 0.2) { const c = ensure(); if (!c) return; const o = c.createOscillator(), g = c.createGain(); o.type = type; o.frequency.value = f; g.gain.setValueAtTime(v, c.currentTime); g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur); o.connect(g); g.connect(master); o.start(); o.stop(c.currentTime + dur); }
   return {
-    ensure, note, click, tone, get ctx() { return ensure(); }, get master() { return master; },
+    ensure, ready, unlock, note, click, tone, get ctx() { return ensure(); }, get master() { return master; },
     setVol: v => { vol = v; if (master) master.gain.value = v; }, timbres: Object.keys(TIMBRES),
     // 곡 재생: 반환값 stop()
     playScore(S, o = {}) {
       const c = ensure(); if (!c) return { stop() { }, dur: 0 };
       const spb = 60 / ((o.tempo || S.tempo) * (o.scale || 1)), t0 = (o.when ?? c.currentTime + 0.1), from = o.from || 0, to = o.to ?? Infinity, hs = o.hands || 'both', handles = [];
+      const q = [];
       S.staves.forEach(st => {
         if (o.only === 'solo' && !st.solo) return; if (o.only === 'nosolo' && st.solo) return;
         if (o.only !== 'solo' && hs !== 'both' && st.hand && st.hand !== hs && !o.backing) return;
         const quiet = hs !== 'both' && st.hand && st.hand !== hs;
-        st.events.forEach(e => { if (!e.p.length || e.t < from || e.t >= to) return; e.p.forEach(p => { const h = note(p + (st.transpose ? 0 : 0), { when: t0 + (e.t - from) * spb, dur: e.d * spb * 0.95, vel: quiet ? 0.35 : 0.7, timbre: o.timbre || st.timbre || 'piano' }); if (h) handles.push(h); }); });
+        st.events.forEach(e => { if (!e.p.length || e.t < from || e.t >= to) return; e.p.forEach(p => q.push({ p, when: t0 + (e.t - from) * spb, dur: e.d * spb * 0.95, vel: quiet ? 0.35 : 0.7, timbre: o.timbre || st.timbre || 'piano' })); });
       });
-      return { stop() { handles.forEach(h => h.stop()); }, t0, dur: (Math.min(scoreBeats(S), to) - from) * spb };
+      q.sort((x, y) => x.when - y.when);
+      // 긴 곡에서 수천 개의 발진기를 한꺼번에 만들면 모바일에서 소리가 끊기거나 멈추므로 1.5초 앞까지만 예약
+      let qi = 0, timer = null;
+      const pump = () => {
+        const c2 = ensure(); if (!c2) return; const lim = c2.currentTime + 1.5;
+        while (qi < q.length && q[qi].when < lim) { const n = q[qi++]; if (n.when < c2.currentTime - 0.2) continue; const h = note(n.p, n); if (h) handles.push(h); }
+        if (handles.length > 64) handles.splice(0, handles.length - 64);
+        if (qi >= q.length && timer) { clearInterval(timer); timer = null; }
+      };
+      pump(); if (qi < q.length) timer = setInterval(pump, 200);
+      return { stop() { if (timer) { clearInterval(timer); timer = null; } qi = q.length; handles.forEach(h => h.stop()); }, t0, dur: (Math.min(scoreBeats(S), to) - from) * spb };
     }
   };
 })();
@@ -615,8 +658,8 @@ const Input = (() => {
     }
     if (!micStream) { const r = micErr(lastErr, embedded, permState); return Object.assign({ ok: false, err: lastErr && lastErr.name }, r); }
     micCtx = Audio_.ensure(); try { if (micCtx.state !== 'running') await micCtx.resume(); } catch (e) { } const sr = micCtx.sampleRate, N = S.win || 8192;
-    ana = new DSP.Analyzer(sr, N, { maxPoly: S.maxPoly || 6, relThr: S.relThr || 0.012 });
-    tracker = new DSP.NoteTracker(); onset = new DSP.OnsetDetector(sr);
+    ana = new DSP.Analyzer(sr, N, { maxPoly: S.maxPoly || 6, relThr: S.relThr || 0.012, oddMin: S.oddMin ?? 2 });
+    tracker = new DSP.NoteTracker(S.trk || {}); onset = new DSP.OnsetDetector(sr); if (S.onsetK) onset.k = S.onsetK;
     ring = new Float32Array(N); ringPos = 0; filled = 0; sinceHop = 0; st.sr = sr; st.N = N; st.settings = S;
     const src = micCtx.createMediaStreamSource(micStream);
     const handle = block => processBlock(block, S);
@@ -628,7 +671,7 @@ const Input = (() => {
     } catch (e) { ok = false; }
     if (!ok) { micNode = micCtx.createScriptProcessor(1024, 1, 1); micNode.onaudioprocess = e => { const d = e.inputBuffer.getChannelData(0); for (let o = 0; o < d.length; o += 512) handle(d.slice(o, o + 512)); }; src.connect(micNode); }
     const sink = micCtx.createGain(); sink.gain.value = S.monitor ? 0.6 : 0; micNode.connect(sink); sink.connect(micCtx.destination); st.sink = sink;
-    st.micOn = true; st.micNode = micNode; st.mode = ok ? 'AudioWorklet' : 'ScriptProcessor'; st.maxRaw = 0; st.silent = false;
+    st.hopNow = 0; st.cn = 0; st.cost = 0; st.floor = 0; st.bk = null; st.f2 = null; st.armedUntil = 0; st.cH = null; st.micOn = true; st.micNode = micNode; st.mode = ok ? 'AudioWorklet' : 'ScriptProcessor'; st.maxRaw = 0; st.silent = false;
     const trk = micStream.getAudioTracks()[0]; if (trk) trk.onended = () => { if (st.micOn) { stopMic(); emit({ type: 'micwarn', code: 'ended' }); } };
     setTimeout(() => { if (st.micOn && st.maxRaw === 0) { st.silent = true; emit({ type: 'micwarn', code: 'silent', muted: !!(trk && trk.muted) }); } }, 2500);
     return { ok: true, msg: `마이크 인식 시작 (${st.mode}, ${sr}Hz, 분석창 ${N}샘플 ≈ ${(N / sr * 1000) | 0}ms).` };
@@ -641,26 +684,25 @@ const Input = (() => {
     for (let i = 0; i < n; i++) { ring[ringPos] = b[i] * gain; ringPos = (ringPos + 1) % ring.length; } filled = Math.min(ring.length, filled + n);
     if (onset.gate !== (S.gate || 0.006)) { onset.gate = S.gate || 0.006; }
     const nf = S.nf ?? 2, snr = [0, 2.5, 4, 6][nf] || 0;
-    // 소음 바닥: 최근 4초 구간 평균 에너지의 하위 25% (연주 사이 쉬는 구간·배경 잡음 수준)
+    // 소음 바닥: 최근 12초 구간의 '가장 조용한 순간' (연주 중에도 올라가지 않도록 최솟값 기준, 상한 있음)
     const bk = st.bk || (st.bk = { t: t, s: 0, n: 0, h: [] }); bk.s += r; bk.n++;
-    if (t - bk.t >= 0.05) { const v = bk.s / bk.n; bk.t = t; bk.s = 0; bk.n = 0; if (v > 1e-5) { bk.h.push(v); if (bk.h.length > 80) bk.h.shift(); const q = bk.h.slice().sort((x, y) => x - y); st.floor = q[Math.floor(q.length * 0.25)]; } }
+    if (t - bk.t >= 0.05) { const v = bk.s / bk.n; bk.t = t; bk.s = 0; bk.n = 0; if (v > 1e-5) { bk.h.push(v); if (bk.h.length > 240) bk.h.shift(); st.floor = Math.min(0.02, Math.min(...bk.h)); } }
     if (!st.floor) st.floor = 1e-4;
     const loud = !snr || r > st.floor * snr;
-    if (onset.push(r * gain, t)) { tracker.addOnset(t - 0.012); st.lastOnset = t; if (loud) st.armedUntil = t + [99, 3, 2.2, 1.5][nf]; }
+    if (onset.push(r * gain, t)) { tracker.addOnset(t - 0.012); st.lastOnset = t; if (loud && true) st.armedUntil = t + [99, 3, 2.2, 1.5][nf]; }
     sinceHop += n;
-    if (sinceHop >= (S.hop || 1024) && filled >= ring.length) {
-      sinceHop = 0;
+    if (sinceHop >= (st.hopNow || S.hop || 1024) && filled >= ring.length) {
+      sinceHop = 0; const pt0 = performance.now();
       const N = ring.length, fr = new Float32Array(N); for (let i = 0; i < N; i++) fr[i] = ring[(ringPos + i) % N];
       const sens = S.sens ?? 1; ana.opt.relThr = 0.012 / sens; ana.opt.minSal = 0.42 / Math.sqrt(sens);
       const res = ana.analyze(fr, (S.gate || 0.006) * 0.5);
-      let notes = res.notes.filter(x => x.conf >= (S.minConf || 0.35) + (nf ? 0.04 * nf : 0));
+      let notes = res.notes.filter(x => x.conf >= (S.minConf || 0.35) + (nf ? 0.02 * nf : 0));
       if (nf) {
         // 잡음·숨소리·말소리 걸러내기: ①소음 바닥보다 충분히 커야 함 ②타건(급격한 시작) 없이는 새 음 금지 ③배음 구조 확인
         const act = new Set(tracker.active().map(a => a.midi)), armed = t < (st.armedUntil || 0);
         if (!loud) notes = notes.filter(x => act.has(x.midi) && r > st.floor * 1.3);
-        else if (!armed) notes = notes.filter(x => act.has(x.midi));
+        else if (!armed && !(act.size && t - (st.voiceLike || -9) > 2)) notes = [];
         notes = notes.filter(x => (x.harm == null || x.harm >= 2) && !(nf >= 2 && x.midi < 33 && x.conf < 0.7));
-        if (nf >= 2 && notes.length > 4) notes = notes.slice().sort((a, b) => b.conf - a.conf).slice(0, 4);
       }
       // 단음이면 YIN으로 교차 검증 및 센트 계산
       st.yin = null;
@@ -671,10 +713,37 @@ const Input = (() => {
         if (H.length >= 5 && t - (st.lastOnset || 0) > 0.25) { const m = H.reduce((a, b) => a + b, 0) / H.length, sd = Math.sqrt(H.reduce((a, b) => a + (b - m) * (b - m), 0) / H.length); if (sd > (nf >= 3 ? 14 : 22)) { notes = []; st.voiceLike = t; } }
       }
       st.detect = notes; st.rmsFrame = res.rms;
-      const evs = tracker.update(notes, t, N / st.sr);
+      // 음별 에너지 기록(전 음역): ① 같은 음 재타건 검출 ② 새 음의 정확한 시작 시각 소급 추정
+      const restr = new Set(), est = new Map();
+      try {
+        const M2 = 2048; if (!st.f2) { st.f2 = { fft: DSP.makeFFT(M2), re: new Float32Array(M2), im: new Float32Array(M2), mag: new Float32Array(M2 / 2), w: Float32Array.from({ length: M2 }, (_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (M2 - 1))), H: [], T: [] }; for (let m = 0; m < 128; m++) st.f2.H.push([]); }
+        const F = st.f2, sr2 = st.sr; for (let i = 0; i < M2; i++) { F.re[i] = fr[N - M2 + i] * F.w[i]; F.im[i] = 0; } F.fft(F.re, F.im); for (let k = 0; k < M2 / 2; k++) F.mag[k] = Math.hypot(F.re[k], F.im[k]);
+        // 배음별(h=1..5) 대역 에너지. 인접 반음과 겹치지 않는 대역만 사용(기음은 250Hz 이상일 때만)
+        const bandH = m => { const f0 = DSP.m2f(m), out = []; for (let h = 1; h <= 5; h++) { const f = f0 * h; if (f > 4500) break; if (f < (h === 1 ? 250 : 120)) continue; const k = Math.round(f * M2 / sr2); let mx = 0; for (let j = k - 1; j <= k + 1; j++) if (F.mag[j] > mx) mx = F.mag[j]; out.push(mx); } return out; };
+        const actStart = new Map(tracker.active().map(a => [a.midi, a.start])), actv = new Set(actStart.keys()), want = new Set(notes.map(x => x.midi)); F.T.push(t); if (F.T.length > 16) F.T.shift();
+        for (let m = 21; m <= 108; m++) {
+          const Bh = bandH(m), h = F.H[m], B = Bh.reduce((a, b) => a + b, 0);
+          if (!S.rsOff && actv.has(m) && want.has(m) && h.length >= 7 && Bh.length >= 2) {
+            // 모든 배음 대역이 동시에 크게 상승해야 재타건 (다른 음의 배음 간섭은 일부 대역만 올림)
+            // 먼저 한 번 울렸다가(최대) → 감쇠해(골짜기) → 다시 급상승하는 패턴만 재타건으로 인정
+            const L = h.length; let iv = L - 1; for (let q = L - 1; q >= Math.max(0, L - 8); q--) if (h[q].s <= h[iv].s) iv = q;
+            let pre = 0, ip = 0; for (let q = 0; q < iv; q++) if (h[q].s >= pre) { pre = h[q].s; ip = q; }
+            const t0n = actStart.get(m), tp = F.T[F.T.length - 1 - (L - ip)];
+            let ok = iv >= 1 && iv < L && pre >= h[iv].s * (S.preK || 1.5) && t0n !== undefined && tp !== undefined && tp >= t0n + 0.03, mxB = pre;
+            for (let i = 0; i < Bh.length && ok; i++) { let v = 1e18; v = h[iv].b[i] ?? 1e18; if (!(Bh[i] > v * (S.rsK || 1.7) + 0.5)) ok = false; }
+            if (ok && B > mxB * 0.2) restr.add(m);
+          }
+          if (want.has(m) && !actv.has(m)) { const thr = B * (S.onK || 0.4); let i = h.length; while (i > 0 && h[i - 1].s >= thr) i--; const tt = (F.T[F.T.length - 1 - (h.length - i)] ?? t) - 0.025; if (t - tt < 0.45) est.set(m, tt); }
+          h.push({ b: Bh, s: B }); if (h.length > 15) h.shift();
+        }
+      } catch (e) { }
+      const evs = tracker.update(notes, t, N / st.sr, restr, est);
       const comp = (S.latencyMs ?? 0) / 1000;
       for (const e of evs) emit({ type: e.type, midi: e.midi, vel: clamp(e.amp ? 0.3 + e.amp * 2 : 0.6, 0.2, 1), src: 'mic', time: e.time - comp, conf: e.conf, dur: e.dur, retrig: !!e.retrig });
       subs.forEach(fn => fn({ type: 'frame', notes, level: st.level, rms: res.rms, time: t }));
+      // 처리 부하 자동 조절: 한 프레임 처리가 간격의 60%를 넘으면 분석 간격을 늘려 끊김 방지
+      const pc = performance.now() - pt0; st.cn = (st.cn || 0) + 1; if (st.cn > 40) st.cost = st.cost ? st.cost * 0.95 + pc * 0.05 : pc; const hopMs = (st.hopNow || S.hop || 1024) / st.sr * 1000;
+      if (st.cost && st.cost > hopMs * 0.6 && (st.hopNow || S.hop || 1024) < 4096) { st.hopNow = (st.hopNow || S.hop || 1024) * 2; st.cost = 0; }
     }
   }
   function stopMic() {
@@ -1922,7 +1991,7 @@ P.stages = STAGES; P.special = SPECIAL; P.songs = SONGS;
 /* PIANOVA UI 기반 — 설정, 토스트/모달, 건반 컴포넌트, 계정, 라우터, 홈/아카데미/프로필/업적/설정/계정 화면 */
 const SET = [
   ['오디오', 'deviceId', 'device', '입력 장치', ''], ['오디오', 'gainDb', 'range', '입력 레벨 보정(dB)', 0, -12, 36, 1], ['오디오', 'gate', 'range', '노이즈 게이트(RMS, 높을수록 작은 소리 무시)', 0.006, 0.001, 0.05, 0.001],
-  ['오디오', 'sens', 'range', '음정 인식 민감도', 1, 0.3, 3, 0.1], ['오디오', 'minConf', 'range', '최소 인식 신뢰도', 0.35, 0.1, 0.9, 0.05], ['오디오', 'nf', 'range', '잡음 제거 강도 (0 끔 · 2 보통 · 3 강함: 숨소리·말소리·백색소음 무시)', 2, 0, 3, 1], ['오디오', 'noiseSup', 'bool', '브라우저 노이즈 제거 (피아노에는 끄는 것을 권장)', false],
+  ['오디오', 'sens', 'range', '음정 인식 민감도', 1, 0.3, 3, 0.1], ['오디오', 'minConf', 'range', '최소 인식 신뢰도', 0.35, 0.1, 0.9, 0.05], ['오디오', 'nf', 'range', '잡음 제거 강도 (0 끔 · 2 보통 · 3 강함: 잡음 많은 환경용)', 2, 0, 3, 1], ['오디오', 'noiseSup', 'bool', '브라우저 노이즈 제거 (피아노에는 끄는 것을 권장)', false],
   ['오디오', 'win', 'select', '분석 창 크기 (클수록 저음 정확·지연 증가)', 8192, [4096, 8192, 16384]], ['오디오', 'latencyMs', 'range', '마이크 입력 지연 보정(ms) — 지연 보정 도구로 측정', 60, 0, 400, 5],
   ['오디오', 'monitor', 'bool', '마이크 모니터링(스피커로 되돌려 듣기, 하울링 주의)', false], ['오디오', 'centsTol', 'range', '음정 정확도 허용 오차(센트, 자유 연주 표시)', 30, 5, 50, 5],
   ['오디오', 'volume', 'range', '출력 볼륨', 0.8, 0, 1, 0.05], ['오디오', 'timbre', 'select', '앱 음색', 'piano', ['piano', 'organ', 'strings', 'flute']], ['오디오', 'hearInput', 'bool', '가상 건반/컴퓨터 키보드 입력 소리 재생', true], ['오디오', 'midiSound', 'bool', 'MIDI 건반 입력 소리 재생 (디지털 피아노 자체 스피커 사용 시 끄기)', true], ['오디오', 'kbdInput', 'bool', '컴퓨터 키보드를 건반으로 사용 (A S D F… / W E T Y U…, Z·X 옥타브)', true],
@@ -2331,6 +2400,11 @@ async function openShare(o) {
   });
 }
 
+document.addEventListener('audio-hint', e => {
+  if (e.detail === 'ios') toast('🔊 소리가 안 나면 벨소리 스위치(무음 모드)를 끄고 볼륨을 올려 주세요.');
+  else toast('🔇 소리가 켜지지 않았어요. 화면을 한 번 터치/클릭한 뒤 다시 시도하고, 기기 볼륨과 무음 모드를 확인하세요.');
+});
+
 /* ═══ app_play.js ═══ */
 /* PIANOVA 연주 화면 — Player 컴포넌트, 레코더, 연주/스테이지 화면, 곡 라이브러리, 자유 연주, 퀴즈 엔진 */
 const MODES = [['listen', '감상 모드'], ['demo', '시범 연주 모드'], ['rh', '오른손만 연주'], ['lh', '왼손만 연주'], ['both', '양손 연주'], ['slow', '느린 연습 (50%)'], ['loop', '구간 반복'], ['mistakes', '틀린 부분 반복'], ['scoreonly', '악보만 보기'], ['rhythm', '리듬만 연습'], ['metro', '메트로놈 연습'], ['memo', '암보 연주'], ['perform', '실전 공연'], ['record', '녹음 및 분석']];
@@ -2514,7 +2588,7 @@ Views.play = (main, arg) => {
   function startDemo(h) { if (running) return; reset(); running = true; Pl.run({ mode: 'listen', hands: h || 'both', from: 0, to: total, scale }, () => { running = false; }); }
   // 모드별 시작
   async function startMode() {
-    if (running) return; const m = $('#mode').value; Audio_.ensure();
+    if (running) return; const m = $('#mode').value; await Audio_.ready(900);
     if (m === 'listen') { $('#kbwrap').style.display = 'none'; return startDemo('both'); }
     if (m === 'demo') { $('#kbwrap').style.display = ''; return startDemo($('#hands').value); }
     if (m === 'scoreonly') { toast('악보만 보기 모드입니다. 연주 없이 악보를 살펴보세요.'); return; }
@@ -3031,7 +3105,6 @@ async function boot() {
   renderTop(); addEventListener('hashchange', show);
   addEventListener('error', e => { try { toast('오류: ' + (e.message || e)); } catch (_) { } });
   addEventListener('unhandledrejection', e => { try { toast('오류: ' + ((e.reason && e.reason.message) || e.reason)); } catch (_) { } });
-  addEventListener('pointerdown', () => { try { Audio_.ensure(); } catch (e) { } }, { once: true });
   show();
   window.PIANOVA = P; window.__pianova = { Game, Input, Store, go, Views, SP, Composer, Quiz, QGEN };
 }
